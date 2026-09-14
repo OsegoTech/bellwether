@@ -56,6 +56,19 @@ notify:
 store:
   sqlite_path: /var/lib/bellwether/bellwether.db
 
+collectors:
+  oplog_window:
+    # Two serverStatus reads this far apart measure the live write rate on a
+    # secondary; 0 disables sampling (mean rate over the window is used).
+    sample_interval_seconds: 10
+
+detectors:
+  oplog_window:
+    # Conservative resync estimate: the longest a secondary may be down.
+    maintenance_window_seconds: 3600
+    # WARNING while the window is under resync x safety_factor; CRITICAL under resync.
+    safety_factor: 2.0
+
 executor:
   # Write identity meetadev-ai-exec — distinct from the read identity above,
   # with its own cert. Off until an operator deliberately turns it on.

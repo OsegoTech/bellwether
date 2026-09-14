@@ -237,6 +237,28 @@ class ExecutorConfig(_Section):
         return self
 
 
+class OplogWindowCollectorConfig(_Section):
+    # Gap between the two serverStatus reads that measure the live write rate.
+    # 0 disables sampling; the collector then reports the oplog's mean rate.
+    sample_interval_seconds: float = Field(default=10.0, ge=0)
+
+
+class CollectorsConfig(_Section):
+    oplog_window: OplogWindowCollectorConfig = Field(default_factory=OplogWindowCollectorConfig)
+
+
+class OplogWindowDetectorConfig(_Section):
+    # Conservative resync estimate: how long a secondary may be down for
+    # maintenance and still need to catch up from the oplog.
+    maintenance_window_seconds: int = Field(default=3600, gt=0)
+    # WARNING while the window is under resync x safety_factor.
+    safety_factor: float = Field(default=2.0, ge=1.0)
+
+
+class DetectorsConfig(_Section):
+    oplog_window: OplogWindowDetectorConfig = Field(default_factory=OplogWindowDetectorConfig)
+
+
 class BellwetherConfig(BaseSettings):
     """Root config. Build it with :func:`load_config`, which applies the YAML layer.
 
@@ -256,6 +278,8 @@ class BellwetherConfig(BaseSettings):
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     store: StoreConfig
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
+    collectors: CollectorsConfig = Field(default_factory=CollectorsConfig)
+    detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
 
     @classmethod
     def settings_customise_sources(
