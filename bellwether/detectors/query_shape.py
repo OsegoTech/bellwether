@@ -29,6 +29,9 @@ MongoDB documents for its pipeline shapes.
 The **candidate index** for a shape is built by MongoDB's documented ESR rule
 (equality, sort, range) — the field order is computed here, never chosen by a
 model. See ``build_candidate``.
+
+A shape's **Impact** is Performance Advisor's "total wasted bytes read":
+documents examined but not returned, times their size. See ``impact``.
 """
 
 from __future__ import annotations
@@ -292,6 +295,75 @@ def equality_frequency(shapes: Iterable[QueryShape]) -> dict[str, int]:
         for field in shape.fields(EQ):
             counts[field] = counts.get(field, 0) + 1
     return counts
+
+
+SIZE_FROM_COLLSTATS = "collstats"
+SIZE_ESTIMATED = "estimated_from_ops"
+SIZE_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ShapeImpact:
+    """Performance Advisor's per-shape inputs, and its Impact: wasted bytes read."""
+
+    shape_key: str
+    op_count: int
+    total_docs_examined: int
+    total_docs_returned: int
+    targeting_ratio: float  # docs examined per doc returned; 1.0 is perfect
+    avg_object_size: float | None
+    avg_object_size_source: str  # collstats | estimated_from_ops | unknown
+    wasted_bytes: int  # (examined - returned) x avg object size, summed over ops
+    total_millis: int
+    worst_millis: int
+
+
+def impact(
+    shape_ops: Sequence[Mapping[str, Any]], avg_object_size: float | None = None
+) -> ShapeImpact:
+    """Impact of one shape's ops, as Performance Advisor documents it.
+
+    ``wasted_bytes`` is documents examined but not returned, times their
+    average size, summed: the bytes read for nothing. The size comes from
+    ``$collStats`` when the evidence has it. Otherwise it is estimated as
+    response bytes per returned document — a projected or short response
+    makes that an underestimate — and when neither is available it is
+    unknown and wasted_bytes is 0, while targeting_ratio still shows the waste.
+    """
+    if not shape_ops:
+        raise ValueError("impact needs at least one op")
+    examined = sum(_count(o.get("docsExamined")) for o in shape_ops)
+    returned = sum(_count(o.get("nreturned")) for o in shape_ops)
+    size: float | None
+    if avg_object_size:
+        size, source = float(avg_object_size), SIZE_FROM_COLLSTATS
+    else:
+        response = sum(_count(o.get("responseLength")) for o in shape_ops)
+        if returned and response:
+            size, source = response / returned, SIZE_ESTIMATED
+        else:
+            size, source = None, SIZE_UNKNOWN
+    wasted_docs = sum(
+        max(_count(o.get("docsExamined")) - _count(o.get("nreturned")), 0) for o in shape_ops
+    )
+    millis = [_count(o.get("millis")) for o in shape_ops]
+    return ShapeImpact(
+        shape_key=shape_of(shape_ops[0]).key,
+        op_count=len(shape_ops),
+        total_docs_examined=examined,
+        total_docs_returned=returned,
+        targeting_ratio=examined / max(returned, 1),
+        avg_object_size=size,
+        avg_object_size_source=source,
+        wasted_bytes=round(wasted_docs * size) if size else 0,
+        total_millis=sum(millis),
+        worst_millis=max(millis),
+    )
+
+
+def rank_impacts(impacts: Iterable[ShapeImpact]) -> list[ShapeImpact]:
+    """Highest Impact first: wasted bytes, then total millis, then shape key."""
+    return sorted(impacts, key=lambda i: (-i.wasted_bytes, -i.total_millis, i.shape_key))
 
 
 def iso(value: Any) -> str | None:
