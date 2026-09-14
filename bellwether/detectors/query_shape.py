@@ -16,12 +16,24 @@ each field, which is also exactly what an index decision needs:
 
 A field carrying several operators takes the strongest class, in the order
 above: ``{a: {$in: [1, 2], $gt: 0}}`` is equality.
+
+A **query shape** is (namespace, each filtered field with its class, the sort
+spec); its ``key`` is a stable hash of those, so queries that differ only in
+literal values share a shape. This is a real but bounded approximation of
+MongoDB's own query-shape hashing (``queryHash`` / ``queryShapeHash``). It is
+coarser: MongoDB distinguishes ``$gt`` from ``$lt``, ``$in`` list lengths,
+projection and collation; here they share a class. Aggregations take their
+consecutive leading ``$match`` stages as one filter — the same approximation
+MongoDB documents for its pipeline shapes.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -143,6 +155,52 @@ def redact_op(entry: Mapping[str, Any]) -> dict[str, Any] | None:
         "planSummary": str(entry.get("planSummary") or ""),
         "ts": iso(entry.get("ts")),
     }
+
+
+@dataclass(frozen=True)
+class QueryShape:
+    namespace: str
+    filter: tuple[tuple[str, str], ...]  # (field, operator class), sorted by field
+    sort: tuple[tuple[str, int], ...]  # (field, 1 | -1), in sort order
+
+    @property
+    def key(self) -> str:
+        """Stable across processes and literal values: a hash of the shape itself."""
+        canonical = json.dumps(
+            [self.namespace, [list(f) for f in self.filter], [list(s) for s in self.sort]],
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+    def fields(self, *classes: str) -> tuple[str, ...]:
+        """Filtered fields whose operator class is one of `classes`, by name."""
+        return tuple(field for field, cls in self.filter if cls in classes)
+
+    def as_evidence(self) -> dict[str, Any]:
+        return {"filter": dict(self.filter), "sort": [list(s) for s in self.sort]}
+
+
+def shape_of(record: Mapping[str, Any]) -> QueryShape:
+    """The shape of a redacted op record (see redact_op)."""
+    filter = record.get("filter") or {}
+    return QueryShape(
+        namespace=str(record.get("ns", "")),
+        filter=tuple(sorted((str(f), str(c)) for f, c in filter.items())),
+        sort=tuple((str(f), int(d)) for f, d in record.get("sort") or []),
+    )
+
+
+def shape_of_query(namespace: str, filter: Mapping[str, Any], sort: Any = None) -> QueryShape:
+    """The shape of a raw query: redacts, then shapes."""
+    return shape_of({"ns": namespace, "filter": redact_filter(filter), "sort": sort_spec(sort)})
+
+
+def group_by_shape(records: Iterable[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
+    """Records grouped by shape key, in first-seen order."""
+    groups: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        groups.setdefault(shape_of(record).key, []).append(record)
+    return groups
 
 
 def iso(value: Any) -> str | None:
