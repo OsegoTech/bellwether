@@ -21,7 +21,7 @@ from typing import Any, cast
 import pytest
 from pymongo.errors import OperationFailure
 
-from bellwether.config import ExecutorConfig
+from bellwether.config import ExecutorConfig, MongoConfig
 from bellwether.detectors.base import OP_NODE_EVIDENCE, OPID_EVIDENCE, killable_op_evidence
 from bellwether.executor import whitelist
 from bellwether.executor.executor import ExecutionRefused, Executor
@@ -34,8 +34,9 @@ from bellwether.models import (
     Proposal,
     RemediationAction,
 )
-from bellwether.mongo import ClientFactory
+from bellwether.mongo import ClientFactory, ReadOnlyMongo
 from bellwether.store.sqlite import SqliteStore
+from tests.fakes import FALLBACKS, READ_URI, FakeCluster
 
 T0 = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
 WESTEUROPE = "node-westeurope.mongo.internal:27017"
@@ -640,6 +641,35 @@ def test_killable_op_evidence_is_what_the_executor_reads(
 
     assert result.state is ApprovalState.EXECUTED
     assert world.clients[0].uri.startswith(f"mongodb://{UAE}/?")
+
+
+def test_cluster_sweep_feeds_kill_op_to_the_node_the_op_runs_on(
+    store: SqliteStore, world: FakeWorld
+) -> None:
+    # Read side: find the op where it runs. Write side: kill it there.
+    cluster = FakeCluster()
+    cluster.aggregations["$currentOp"] = lambda node, ns, pipeline: (
+        [{"opid": 777, "secs_running": 1200}] if node == SOUTHAFRICA else []
+    )
+    reader = ReadOnlyMongo(
+        MongoConfig(
+            uri=READ_URI,
+            tls_ca_file=CA,
+            tls_cert_file=Path("/etc/bellwether/tls/meetadev-ai.combined.pem"),
+            target_node=BACKUP,
+            fallback_nodes=FALLBACKS,
+        ),
+        client_factory=cluster.factory(),
+    )
+    [op] = reader.current_op_all_nodes().ops
+    assert op.opid is not None
+    base = kill_proposal(opid=op.opid, identified=(), op_node=None, node=op.node)
+    proposal = replace(base, evidence_refs=killable_op_evidence(op.opid, op.node))
+
+    make_executor(store, world).execute(proposal, approved(store, proposal))
+
+    assert world.clients[0].uri.startswith(f"mongodb://{SOUTHAFRICA}/?")
+    assert world.commands == [("admin", {"killOp": 1, "op": 777})]
 
 
 def test_command_string_is_never_shell_executed(

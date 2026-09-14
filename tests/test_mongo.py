@@ -20,6 +20,7 @@ from bson import Timestamp
 from pydantic import SecretStr
 
 from bellwether.config import MongoConfig
+from bellwether.detectors.base import OP_NODE_EVIDENCE, OPID_EVIDENCE, killable_op_evidence
 from bellwether.mongo import ForbiddenCommand, NoReachableNode, ReadOnlyMongo
 from tests.fakes import FALLBACKS, READ_URI, SOUTHAFRICA, TARGET, UAE, WESTEUROPE, FakeCluster
 
@@ -202,6 +203,7 @@ READ_API = {
     "profile_read",
     "index_stats",
     "current_op",
+    "current_op_all_nodes",
     "served_by",
     "close",
 }
@@ -345,3 +347,146 @@ def test_close_closes_the_client(cluster: FakeCluster) -> None:
 
     assert cluster.clients[0].closed
     assert mongo.served_by is None
+
+
+# --- The one exception: cluster-wide currentOp ---------------------------------------
+
+MEMBERS = [TARGET, WESTEUROPE, UAE, SOUTHAFRICA]  # backup (default target) first, then voters
+
+
+def sweep_cluster(
+    table: dict[str, list[dict[str, Any]]],
+) -> tuple[FakeCluster, list[tuple[str, list[dict[str, Any]]]]]:
+    """A cluster whose members report the ops in `table`; records each $currentOp read."""
+    cluster = FakeCluster()
+    seen: list[tuple[str, list[dict[str, Any]]]] = []
+
+    def handler(node: str, ns: str, pipeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen.append((node, pipeline))
+        return [dict(op) for op in table.get(node, [])]
+
+    cluster.aggregations["$currentOp"] = handler
+    return cluster, seen
+
+
+def test_current_op_all_nodes_reads_every_member_and_tags_the_node() -> None:
+    cluster, seen = sweep_cluster(
+        {
+            TARGET: [{"opid": 11, "op": "query"}],
+            UAE: [{"opid": 4242, "secs_running": 900}, {"opid": 4243}],
+        }
+    )
+
+    result = client_for(cluster).current_op_all_nodes()
+
+    assert [node for node, _ in seen] == MEMBERS
+    assert result.nodes_read == tuple(MEMBERS)
+    assert result.unreachable == {}
+    assert [(op.node, op.opid) for op in result.ops] == [(TARGET, 11), (UAE, 4242), (UAE, 4243)]
+    assert result.ops[1].op["secs_running"] == 900
+
+
+def test_sweep_connections_are_direct_read_identity_and_closed() -> None:
+    cluster, _ = sweep_cluster({})
+
+    client_for(cluster).current_op_all_nodes()
+
+    assert cluster.attempted_nodes == MEMBERS
+    for client, node in zip(cluster.clients, MEMBERS):
+        assert client.uri == READ_URI.replace(TARGET, node)
+        assert client.kwargs["directConnection"] is True
+        assert client.kwargs["tlsCertificateKeyFile"] == str(CERT)  # meetadev-ai, the read identity
+        assert "tlsCertificateKeyFile" not in client.uri
+        assert client.closed
+
+
+def test_sweep_only_ever_runs_currentop() -> None:
+    cluster, seen = sweep_cluster({UAE: [{"opid": 1}]})
+
+    client_for(cluster).current_op_all_nodes({"secs_running": {"$gte": 60}})
+
+    assert {(c.op, c.target) for c in cluster.calls} == {("aggregate", "$currentOp")}
+    for _, pipeline in seen:
+        assert pipeline[0]["$currentOp"]["allUsers"] is True
+        assert pipeline[1] == {"$match": {"secs_running": {"$gte": 60}}}
+
+
+def test_unreachable_member_is_reported_not_fatal() -> None:
+    cluster, _ = sweep_cluster({WESTEUROPE: [{"opid": 7}]})
+    cluster.down.add(UAE)
+
+    result = client_for(cluster).current_op_all_nodes()
+
+    assert set(result.unreachable) == {UAE}
+    assert "ServerSelectionTimeoutError" in result.unreachable[UAE]
+    assert result.nodes_read == (TARGET, WESTEUROPE, SOUTHAFRICA)
+    assert [(op.node, op.opid) for op in result.ops] == [(WESTEUROPE, 7)]
+
+
+def test_sweep_with_no_reachable_member_raises() -> None:
+    cluster, _ = sweep_cluster({})
+    cluster.down.update(MEMBERS)
+
+    with pytest.raises(NoReachableNode) as excinfo:
+        client_for(cluster).current_op_all_nodes()
+
+    for node in MEMBERS:
+        assert node in str(excinfo.value)
+
+
+def test_sweep_leaves_the_single_node_default_alone() -> None:
+    cluster, _ = sweep_cluster({})
+    cluster.reply("serverStatus", {"ok": 1.0})
+    mongo = client_for(cluster)
+    mongo.server_status()
+    serving = cluster.clients[0]
+
+    mongo.current_op_all_nodes()
+    mongo.server_status()
+
+    assert mongo.served_by == TARGET
+    assert not serving.closed
+    assert len(cluster.clients) == 1 + len(MEMBERS)  # the second read reused the serving client
+    assert [c.node for c in cluster.commands_sent("serverStatus")] == [TARGET, TARGET]
+
+
+def test_sweep_logs_each_member_read(caplog: pytest.LogCaptureFixture) -> None:
+    cluster, _ = sweep_cluster({})
+
+    with caplog.at_level(logging.INFO, logger="bellwether.mongo"):
+        client_for(cluster).current_op_all_nodes()
+
+    served = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "read served" and getattr(r, "operation") == "current_op_all_nodes"
+    ]
+    assert [getattr(r, "node") for r in served] == MEMBERS
+
+
+def test_duplicate_members_are_swept_once() -> None:
+    cluster, _ = sweep_cluster({})
+
+    client_for(cluster, fallback_nodes=[WESTEUROPE, TARGET, WESTEUROPE]).current_op_all_nodes()
+
+    assert cluster.attempted_nodes == [TARGET, WESTEUROPE]
+
+
+def test_non_integer_opid_is_not_killable() -> None:
+    cluster, _ = sweep_cluster({UAE: [{"opid": "shard01:4242"}, {"desc": "no opid"}]})
+
+    ops = client_for(cluster).current_op_all_nodes().ops
+
+    assert [op.opid for op in ops] == [None, None]
+    assert [op.node for op in ops] == [UAE, UAE]
+
+
+def test_node_op_feeds_killable_op_evidence() -> None:
+    cluster, _ = sweep_cluster({SOUTHAFRICA: [{"opid": 777, "secs_running": 1200}]})
+
+    [op] = client_for(cluster).current_op_all_nodes().ops
+    assert op.opid is not None
+    opid_evidence, node_evidence = killable_op_evidence(op.opid, op.node)
+
+    assert (opid_evidence.name, opid_evidence.value) == (OPID_EVIDENCE, 777)
+    assert (node_evidence.name, node_evidence.value) == (OP_NODE_EVIDENCE, SOUTHAFRICA)

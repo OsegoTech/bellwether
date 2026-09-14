@@ -13,6 +13,17 @@ Two rules, enforced in code (BUILD_SPEC §3.3):
    everything else before a connection is even opened. The underlying
    ``MongoClient`` is private and never handed out.
 
+One deliberate exception to the single-node default:
+``current_op_all_nodes`` runs ``$currentOp`` on every configured member
+(backup target and voters), each over its own short-lived direct connection.
+An operation is visible only on the mongod running it — a runaway query on
+the primary never appears in the backup node's currentOp — and killOp must be
+sent to that same member. Finding a killable op therefore means looking where
+ops actually run. The exception is narrow: it is the only helper that leaves
+the serving node, it issues nothing but ``$currentOp`` (a read, allowed by
+clusterMonitor's inprog privilege), it uses the same read identity and TLS
+material, and it leaves the serving connection untouched.
+
 Identity is ``meetadev-ai`` (clusterMonitor@admin, read@local,
 read@meetadev_ledger). TLS material reaches ``MongoClient`` as keyword
 arguments, never through the URI, and hostname verification is never disabled.
@@ -93,6 +104,33 @@ class OplogStats:
         return self.last_entry_ts - self.first_entry_ts
 
 
+@dataclass(frozen=True)
+class NodeOp:
+    """One in-progress operation, tagged with the member it is running on.
+
+    ``node`` is the configured member name (as in config, matching the
+    executor's known members), not the server's self-reported ``host`` field.
+    Together with ``opid`` it is what ``detectors.base.killable_op_evidence``
+    needs: killOp must be sent to this node.
+    """
+
+    node: str
+    op: Doc
+
+    @property
+    def opid(self) -> int | None:
+        """The integer opid, or None if absent or not an integer (not killable)."""
+        value = self.op.get("opid")
+        return value if type(value) is int else None
+
+
+@dataclass(frozen=True)
+class ClusterOps:
+    ops: tuple[NodeOp, ...]
+    nodes_read: tuple[str, ...]  # members that answered, in sweep order
+    unreachable: dict[str, str]  # member -> error, for members that did not
+
+
 class ReadOnlyMongo:
     def __init__(self, config: MongoConfig, *, client_factory: ClientFactory = MongoClient) -> None:
         self._config = config
@@ -157,11 +195,55 @@ class ReadOnlyMongo:
         )
 
     def current_op(self, filter: Mapping[str, Any] | None = None) -> list[Doc]:
-        pipeline: list[Doc] = [
-            {"$currentOp": {"allUsers": True, "idleConnections": False}},
-            {"$match": dict(filter or {})},
-        ]
+        """In-progress operations on the serving node only."""
+        pipeline = _current_op_pipeline(filter)
         return self._read("current_op", lambda c: list(c.admin.aggregate(pipeline)))
+
+    def current_op_all_nodes(self, filter: Mapping[str, Any] | None = None) -> ClusterOps:
+        """In-progress operations on every configured member, each tagged with its node.
+
+        THE ONE DELIBERATE EXCEPTION to the single-node default (see the
+        module docstring): currentOp only shows ops on the mongod it is run
+        against, so a runaway op can only be found by asking each member.
+        Strictly read-only — each member gets one ``$currentOp`` aggregation
+        over its own direct connection, closed straight after; the serving
+        connection used by every other helper is not touched.
+
+        A member that cannot be reached is reported in ``unreachable`` rather
+        than failing the sweep; if no member answers, NoReachableNode.
+        """
+        pipeline = _current_op_pipeline(filter)
+        target = self._config.target_node
+        ops: list[NodeOp] = []
+        nodes_read: list[str] = []
+        unreachable: dict[str, str] = {}
+        for node in self._members():
+            client = self._factory(self._uri_for(node), **self._client_kwargs())
+            try:
+                docs = list(client.admin.aggregate(pipeline))
+            except PyMongoError as exc:
+                unreachable[node] = _describe(exc)
+                logger.warning(
+                    "member unreachable during cluster-wide currentOp",
+                    extra={"node": node, "error": unreachable[node]},
+                )
+                continue
+            finally:
+                client.close()
+            nodes_read.append(node)
+            ops.extend(NodeOp(node=node, op=doc) for doc in docs)
+            logger.info(
+                "read served",
+                extra={
+                    "node": node,
+                    "operation": "current_op_all_nodes",
+                    "is_target": node == target,
+                    "ops": len(docs),
+                },
+            )
+        if not nodes_read:
+            raise NoReachableNode(unreachable)
+        return ClusterOps(ops=tuple(ops), nodes_read=tuple(nodes_read), unreachable=unreachable)
 
     def close(self) -> None:
         if self._client is not None:
@@ -199,7 +281,7 @@ class ReadOnlyMongo:
             return self._client, self._node
         target = self._config.target_node
         failures: dict[str, str] = {}
-        for attempt, node in enumerate(dict.fromkeys([target, *self._config.fallback_nodes]), 1):
+        for attempt, node in enumerate(self._members(), 1):
             client = self._factory(self._uri_for(node), **self._client_kwargs())
             try:
                 client.admin.command({"ping": 1})
@@ -222,6 +304,10 @@ class ReadOnlyMongo:
             return client, node
         raise NoReachableNode(failures)
 
+    def _members(self) -> list[str]:
+        """Configured members in order — target first, then fallbacks — once each."""
+        return list(dict.fromkeys([self._config.target_node, *self._config.fallback_nodes]))
+
     def _uri_for(self, node: str) -> str:
         """The configured URI with its host swapped for `node`; options untouched."""
         parts = urlsplit(self._config.uri)
@@ -241,6 +327,13 @@ class ReadOnlyMongo:
         if cfg.tls_cert_passphrase is not None:
             kwargs["tlsCertificateKeyFilePassword"] = cfg.tls_cert_passphrase.get_secret_value()
         return kwargs
+
+
+def _current_op_pipeline(filter: Mapping[str, Any] | None) -> list[Doc]:
+    return [
+        {"$currentOp": {"allUsers": True, "idleConnections": False}},
+        {"$match": dict(filter or {})},
+    ]
 
 
 def _ts_seconds(entry: Mapping[str, Any] | None) -> int | None:
