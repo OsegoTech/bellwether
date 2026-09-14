@@ -26,3 +26,13 @@ class Collector(ABC):
 
     @abstractmethod
     def collect(self, mongo: ReadOnlyMongo) -> Signal | None: ...
+
+    def collect_signals(self, mongo: ReadOnlyMongo) -> list[Signal]:
+        """Every signal from one pass. The pipeline calls this.
+
+        A collector observing one thing (the oplog) emits at most one signal;
+        one observing many things (a signal per profiled collection) overrides
+        this.
+        """
+        signal = self.collect(mongo)
+        return [] if signal is None else [signal]

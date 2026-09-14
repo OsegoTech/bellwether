@@ -117,7 +117,8 @@ class FakeDatabase:
         name = next(iter(doc))
         cluster = self.client.cluster
         cluster._record(self.client.node, self.name, "command", name)
-        handler = cluster.commands.get(name)
+        # A "<db>.<command>" handler answers for one database; "<command>" for all.
+        handler = cluster.commands.get(f"{self.name}.{name}") or cluster.commands.get(name)
         if handler is None:
             raise OperationFailure(f"no such command: '{name}'", code=59)
         return handler(self.client.node, doc)
@@ -160,7 +161,7 @@ class FakeCollection:
         self.database.client.cluster._record(
             self.database.client.node, self.database.name, "find", self.name
         )
-        docs = [d for d in self._docs if all(d.get(k) == v for k, v in (filter or {}).items())]
+        docs = [d for d in self._docs if _matches(d, filter or {})]
         for key, direction in reversed(sort or []):
             docs.sort(key=lambda d: d[key], reverse=direction < 0)
         return docs[:limit] if limit else docs
@@ -248,6 +249,30 @@ def write_config(directory: Path, **sections: Doc) -> Path:
     path = directory / "bellwether.yaml"
     path.write_text(yaml.safe_dump(data))
     return path
+
+
+_QUERY_OPERATORS: dict[str, Callable[[Any, Any], bool]] = {
+    "$eq": lambda value, arg: value == arg,
+    "$ne": lambda value, arg: value != arg,
+    "$in": lambda value, arg: value in arg,
+    "$nin": lambda value, arg: value not in arg,
+    "$gt": lambda value, arg: value is not None and value > arg,
+    "$gte": lambda value, arg: value is not None and value >= arg,
+    "$lt": lambda value, arg: value is not None and value < arg,
+    "$lte": lambda value, arg: value is not None and value <= arg,
+}
+
+
+def _matches(doc: Doc, filter: Mapping[str, Any]) -> bool:
+    """Top-level equality and comparison operators — enough for the helpers' filters."""
+    for field, condition in filter.items():
+        value = doc.get(field)
+        if isinstance(condition, Mapping) and condition and all(k.startswith("$") for k in condition):
+            if not all(_QUERY_OPERATORS[op](value, arg) for op, arg in condition.items()):
+                return False
+        elif value != condition:
+            return False
+    return True
 
 
 def _aggregate(client: FakeClient, db: str, collection: str, pipeline: list[Doc]) -> list[Doc]:

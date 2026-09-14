@@ -105,6 +105,20 @@ class OplogStats:
 
 
 @dataclass(frozen=True)
+class ProfilingStatus:
+    level: int  # 0 off, 1 slow operations, 2 all operations
+    slow_ms: int | None
+    sample_rate: float | None
+
+
+@dataclass(frozen=True)
+class CollectionStats:
+    count: int
+    avg_obj_size: float | None  # absent for an empty collection
+    size_bytes: int
+
+
+@dataclass(frozen=True)
 class NodeOp:
     """One in-progress operation, tagged with the member it is running on.
 
@@ -192,6 +206,36 @@ class ReadOnlyMongo:
             "index_stats",
             lambda c: list(c[db][collection].aggregate([{"$indexStats": {}}])),
             namespace=f"{db}.{collection}",
+        )
+
+    def profiling_status(self, db: str) -> ProfilingStatus:
+        """The profiler level on `db`, as db.getProfilingStatus() reports it.
+
+        Sends ``{profile: -1}``, which only reads the level. The forms that set
+        it (0, 1, 2) are unreachable from here, which is also why ``profile`` is
+        not in run_admin_command's allowlist.
+        """
+        reply = self._read(
+            "profiling_status", lambda c: c[db].command({"profile": -1}), db=db
+        )
+        return ProfilingStatus(
+            level=int(reply["was"]),
+            slow_ms=_opt_int(reply.get("slowms")),
+            sample_rate=_opt_float(reply.get("sampleRate")),
+        )
+
+    def collection_stats(self, db: str, collection: str) -> CollectionStats:
+        """Document count and average object size, from ``$collStats``."""
+        stats = self._read(
+            "collection_stats",
+            lambda c: next(iter(c[db][collection].aggregate([{"$collStats": {"storageStats": {}}}]))),
+            namespace=f"{db}.{collection}",
+        )
+        storage = stats.get("storageStats", {})
+        return CollectionStats(
+            count=int(storage.get("count", 0)),
+            avg_obj_size=_opt_float(storage.get("avgObjSize")) or None,
+            size_bytes=int(storage.get("size", 0)),
         )
 
     def current_op(self, filter: Mapping[str, Any] | None = None) -> list[Doc]:
@@ -334,6 +378,14 @@ def _current_op_pipeline(filter: Mapping[str, Any] | None) -> list[Doc]:
         {"$currentOp": {"allUsers": True, "idleConnections": False}},
         {"$match": dict(filter or {})},
     ]
+
+
+def _opt_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _opt_float(value: Any) -> float | None:
+    return None if value is None else float(value)
 
 
 def _ts_seconds(entry: Mapping[str, Any] | None) -> int | None:

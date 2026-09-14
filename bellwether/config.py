@@ -290,8 +290,23 @@ class OplogWindowCollectorConfig(_Section):
     sample_interval_seconds: float = Field(default=10.0, ge=0)
 
 
+class QueryProfileCollectorConfig(_Section):
+    # Application databases whose profiler is read. Empty: every database the
+    # server lists except admin, local and config.
+    databases: list[str] = Field(default_factory=list)
+    # Performance Advisor's slow-query threshold.
+    slow_ms: int = Field(default=100, gt=0)
+    # Non-COLLSCAN slow ops are kept only above this docs-examined per doc-returned.
+    examined_returned_ratio: float = Field(default=100.0, ge=1.0)
+    # Newest system.profile entries read per database (profile_read caps at 1000).
+    max_profile_entries: int = Field(default=500, ge=1, le=1000)
+    # Slow ops carried per collection signal; the worst by millis are kept.
+    max_ops_per_collection: int = Field(default=50, ge=1)
+
+
 class CollectorsConfig(_Section):
     oplog_window: OplogWindowCollectorConfig = Field(default_factory=OplogWindowCollectorConfig)
+    query_profile: QueryProfileCollectorConfig = Field(default_factory=QueryProfileCollectorConfig)
 
 
 class OplogWindowDetectorConfig(_Section):

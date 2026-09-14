@@ -69,6 +69,15 @@ collectors:
     # Two serverStatus reads this far apart measure the live write rate on a
     # secondary; 0 disables sampling (mean rate over the window is used).
     sample_interval_seconds: 10
+  query_profile:
+    # Application databases whose profiler (system.profile) is read. Empty:
+    # every database except admin/local/config. read@meetadev_ledger exists for this.
+    databases:
+      - meetadev_ledger
+    slow_ms: 100                   # Performance Advisor's slow-query threshold
+    examined_returned_ratio: 100   # non-COLLSCAN slow ops kept above this
+    max_profile_entries: 500       # newest profiler entries read per database
+    max_ops_per_collection: 50     # slowest ops carried per collection
 
 detectors:
   oplog_window:

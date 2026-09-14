@@ -204,6 +204,8 @@ READ_API = {
     "index_stats",
     "current_op",
     "current_op_all_nodes",
+    "profiling_status",
+    "collection_stats",
     "served_by",
     "close",
 }
@@ -241,7 +243,7 @@ def test_underlying_client_is_not_exposed(cluster: FakeCluster) -> None:
         "killOp", "shutdown", "createIndexes", "dropDatabase", "drop", "insert",
         "update", "delete", "findAndModify", "replSetReconfig", "replSetStepDown",
         "replSetResizeOplog", "setParameter", "fsync", "createUser", "compact",
-        "aggregate", "eval",
+        "aggregate", "eval", "profile",
     ],
 )
 def test_run_admin_command_refuses_non_read_commands(cluster: FakeCluster, command: str) -> None:
@@ -347,6 +349,42 @@ def test_close_closes_the_client(cluster: FakeCluster) -> None:
 
     assert cluster.clients[0].closed
     assert mongo.served_by is None
+
+
+def test_profiling_status_reads_the_level_and_never_sets_it(cluster: FakeCluster) -> None:
+    sent: list[dict[str, Any]] = []
+
+    def profile(node: str, doc: dict[str, Any]) -> dict[str, Any]:
+        sent.append(doc)
+        return {"was": 1, "slowms": 100, "sampleRate": 1.0, "ok": 1.0}
+
+    cluster.commands["meetadev_ledger.profile"] = profile
+
+    status = client_for(cluster).profiling_status("meetadev_ledger")
+
+    assert (status.level, status.slow_ms, status.sample_rate) == (1, 100, 1.0)
+    assert sent == [{"profile": -1}]
+    assert cluster.commands_sent("profile")[0].db == "meetadev_ledger"
+
+
+def test_collection_stats(cluster: FakeCluster) -> None:
+    cluster.aggregations["$collStats"] = lambda node, ns, pipeline: [
+        {"ns": ns, "storageStats": {"count": 2_400_000, "avgObjSize": 436, "size": 1_046_400_000}}
+    ]
+
+    stats = client_for(cluster).collection_stats("meetadev_ledger", "transactions")
+
+    assert (stats.count, stats.avg_obj_size, stats.size_bytes) == (2_400_000, 436.0, 1_046_400_000)
+
+
+def test_collection_stats_of_an_empty_collection(cluster: FakeCluster) -> None:
+    cluster.aggregations["$collStats"] = lambda node, ns, pipeline: [
+        {"ns": ns, "storageStats": {"count": 0, "size": 0}}
+    ]
+
+    stats = client_for(cluster).collection_stats("meetadev_ledger", "empty")
+
+    assert (stats.count, stats.avg_obj_size) == (0, None)
 
 
 # --- The one exception: cluster-wide currentOp ---------------------------------------
