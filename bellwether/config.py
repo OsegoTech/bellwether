@@ -142,6 +142,7 @@ class MongoConfig(_Section):
     target_node: str
     fallback_nodes: list[str] = Field(default_factory=list)
     tls_cert_passphrase: SecretStr | None = None
+    server_selection_timeout_ms: int = Field(default=5000, gt=0)
 
     @field_validator("uri")
     @classmethod
