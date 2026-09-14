@@ -1,47 +1,62 @@
 """Query profile collector — the Index Advisor's input (INDEX_ADVISOR_SPEC §A).
 
 Community Edition's equivalent of the slow-query log Performance Advisor reads
-is the database profiler (``system.profile``). Per application database, from
-the serving node, read-only:
+is the database profiler (``system.profile``).
 
-1. The profiler level (``{profile: -1}``). Bellwether does not assume
-   profiling is on: a database with profiling off yields a signal carrying
-   ``profiler_level: 0`` and no ops, which the detector turns into a
-   profiler_disabled finding. If the level cannot be read (the read identity
-   may lack the privilege), it is reported as unknown and the profiler is
-   read anyway.
-2. The newest ``system.profile`` entries for find / aggregate / getMore at or
-   over ``slow_ms``, kept if their plan is a COLLSCAN or they examine many
-   documents per document returned.
-3. For each collection in that slow set: ``$indexStats`` (existing indexes and
-   their use) and ``$collStats`` (document count, average object size).
+**Read on every member.** The profiler, its level, and ``$indexStats`` counters
+are per mongod, and the application's queries run on the primary. Read only
+from the hidden backup node, the profiler is empty and every index looks
+unused. This is the second instance of the deliberate exception documented in
+``bellwether.mongo``: most diagnostics come from the hidden backup node to
+spare the voters; traffic-dependent signals must look where the traffic is.
+Listing the databases is not traffic-dependent and stays on the serving node.
 
-One signal per collection with slow queries. Ops are reduced to query shapes
-(detectors.query_shape.redact_op): field names and operator classes, never
-literal values, clients, or users. At most ``max_ops_per_collection`` ops are
-carried, the slowest first. Index definitions are reduced the same way — a
-partial filter expression becomes a flag, not its literals.
+The sweep, read-only, each member over its own pinned client (closed after):
+
+1. Per application database: the profiler level (``{profile: -1}``) and,
+   unless profiling is off, the newest ``system.profile`` entries for find /
+   aggregate / getMore at or over ``slow_ms``, kept if their plan is a
+   COLLSCAN or they examine many documents per document returned.
+2. For every collection with slow queries on *any* member: each member's
+   ``$indexStats`` and ``$collStats`` — index use must be known everywhere,
+   not only where the slow queries ran.
+
+Signals: one per (member, collection), tagged with the member as its node and
+carrying that member's ops (possibly none), index statistics, and the sweep's
+``members_swept`` / ``members_unreachable``; plus one ``profiler_level: 0``
+signal per (member, database) with profiling off. An unreachable member is
+logged and listed, and the sweep continues; if no member can be read at all,
+NoReachableNode.
+
+Ops are reduced to query shapes (detectors.query_shape.redact_op): field names
+and operator classes, never literal values, clients, or users. At most
+``max_ops_per_collection`` ops are carried per signal, the slowest first.
+Index definitions are reduced the same way — a partial filter expression
+becomes a flag, not its literals.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, ClassVar
 
-from pymongo.errors import OperationFailure
+from pymongo.errors import OperationFailure, PyMongoError
 
 from bellwether.collectors.base import Collector
 from bellwether.config import QueryProfileCollectorConfig
 from bellwether.detectors.query_shape import iso, redact_op
 from bellwether.models import Evidence, Signal, SignalClass
-from bellwether.mongo import ReadOnlyMongo
+from bellwether.mongo import NoReachableNode, ReadOnlyMongo
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_DATABASES = frozenset({"admin", "local", "config"})
 PROFILED_OPS = ("query", "getmore", "command")
+
+Record = dict[str, Any]
+Level = tuple[int | None, str | None]  # (profiler level or None if unreadable, why)
 
 
 class QueryProfileCollector(Collector):
@@ -60,10 +75,59 @@ class QueryProfileCollector(Collector):
         return signals[0] if signals else None
 
     def collect_signals(self, mongo: ReadOnlyMongo) -> list[Signal]:
-        signals: list[Signal] = []
-        for db in self._databases(mongo):
-            signals.extend(self._collect_database(mongo, db))
-        return signals
+        databases = self._databases(mongo)  # not traffic-dependent: the serving node answers
+        if not databases:
+            return []
+        members = mongo.members()
+        readers: dict[str, ReadOnlyMongo] = {}
+        unreachable: dict[str, str] = {}
+        levels: dict[tuple[str, str], Level] = {}
+        slow: dict[tuple[str, str], dict[str, list[Record]]] = {}
+        stats: dict[tuple[str, str, str], tuple[list[Record], int | None, float | None]] = {}
+        try:
+            for node in members:  # pass 1: every member's profiler
+                reader = mongo.member_reader(node)
+                try:
+                    node_levels, node_records = self._read_profiles(reader, databases)
+                except (PyMongoError, NoReachableNode) as exc:
+                    reader.close()
+                    self._mark_unreachable(unreachable, node, exc)
+                    continue
+                readers[node] = reader
+                for db, level in node_levels.items():
+                    levels[(node, db)] = level
+                for key, records in node_records.items():
+                    slow.setdefault(key, {})[node] = records
+                logger.info(
+                    "query profile read",
+                    extra={
+                        "node": node,
+                        "databases": databases,
+                        "slow_ops": sum(len(r) for r in node_records.values()),
+                    },
+                )
+            if not readers:
+                raise NoReachableNode(unreachable)
+
+            for db, collection in sorted(slow):  # pass 2: every member's index use
+                for node in [n for n in members if n in readers]:
+                    try:
+                        index_stats = [
+                            _index_record(doc) for doc in readers[node].index_stats(db, collection)
+                        ]
+                        count, avg_size = self._collection_stats(readers[node], db, collection)
+                    except (PyMongoError, NoReachableNode) as exc:
+                        readers.pop(node).close()
+                        self._mark_unreachable(unreachable, node, exc)
+                        continue
+                    stats[(node, db, collection)] = (index_stats, count, avg_size)
+        finally:
+            for reader in readers.values():
+                reader.close()
+
+        return self._signals(members, unreachable, databases, levels, slow, stats)
+
+    # --- reading ----------------------------------------------------------------------
 
     def _databases(self, mongo: ReadOnlyMongo) -> list[str]:
         if self._config.databases:
@@ -72,82 +136,38 @@ class QueryProfileCollector(Collector):
         names = (d.get("name") for d in reply.get("databases", []))
         return sorted(n for n in names if isinstance(n, str) and n not in SYSTEM_DATABASES)
 
-    def _collect_database(self, mongo: ReadOnlyMongo, db: str) -> list[Signal]:
-        slow_ms = self._config.slow_ms
-        level: int | None = None
-        status_error: str | None = None
+    def _read_profiles(
+        self, reader: ReadOnlyMongo, databases: Sequence[str]
+    ) -> tuple[dict[str, Level], dict[tuple[str, str], list[Record]]]:
+        levels: dict[str, Level] = {}
+        records: dict[tuple[str, str], list[Record]] = {}
+        for db in databases:
+            levels[db] = self._profiling_level(reader, db)
+            if levels[db][0] == 0:
+                continue  # profiling off on this member: nothing recorded to read
+            entries = reader.profile_read(
+                db,
+                {"op": {"$in": list(PROFILED_OPS)}, "millis": {"$gte": self._config.slow_ms}},
+                limit=self._config.max_profile_entries,
+            )
+            for entry in entries:
+                record = redact_op(entry)
+                if record is not None and self._worth_carrying(record):
+                    collection = record["ns"].split(".", 1)[1]
+                    records.setdefault((db, collection), []).append(record)
+        return levels, records
+
+    @staticmethod
+    def _profiling_level(reader: ReadOnlyMongo, db: str) -> Level:
         try:
-            level = mongo.profiling_status(db).level
+            return reader.profiling_status(db).level, None
         except OperationFailure as exc:
-            status_error = f"{type(exc).__name__}: {exc}"[:300]
+            error = f"{type(exc).__name__}: {exc}"[:300]
             logger.warning(
                 "profiler level unreadable; reading system.profile anyway",
-                extra={"db": db, "error": status_error},
+                extra={"db": db, "node": reader.served_by, "error": error},
             )
-        node = mongo.served_by or "unknown"
-        if level == 0:
-            logger.info("profiling is off", extra={"db": db, "node": node})
-            return [
-                Signal(
-                    signal_class=self.signal_class,
-                    source=self.name,
-                    node=node,
-                    evidence=(
-                        Evidence("db", db),
-                        Evidence("profiler_level", 0),
-                        Evidence("slow_ms", slow_ms, "ms"),
-                    ),
-                )
-            ]
-
-        entries = mongo.profile_read(
-            db,
-            {"op": {"$in": list(PROFILED_OPS)}, "millis": {"$gte": slow_ms}},
-            limit=self._config.max_profile_entries,
-        )
-        by_collection: dict[str, list[dict[str, Any]]] = {}
-        for entry in entries:
-            record = redact_op(entry)
-            if record is not None and self._worth_carrying(record):
-                collection = record["ns"].split(".", 1)[1]
-                by_collection.setdefault(collection, []).append(record)
-
-        signals = []
-        for collection in sorted(by_collection):
-            records = sorted(by_collection[collection], key=lambda r: (-r["millis"], r["ts"] or ""))
-            index_stats = [_index_record(doc) for doc in mongo.index_stats(db, collection)]
-            count, avg_size = self._collection_stats(mongo, db, collection)
-            evidence = [
-                Evidence("db", db),
-                Evidence("collection", collection),
-                Evidence("profiler_level", level),
-                Evidence("slow_ms", slow_ms, "ms"),
-                Evidence("slow_ops_seen", len(records)),
-                Evidence("ops", records[: self._config.max_ops_per_collection]),
-                Evidence("index_stats", index_stats),
-                Evidence("collection_doc_count", count, "docs"),
-                Evidence("avg_object_size", avg_size, "bytes"),
-            ]
-            if status_error is not None:
-                evidence.append(Evidence("profiler_status_error", status_error))
-            signals.append(
-                Signal(
-                    signal_class=self.signal_class,
-                    source=self.name,
-                    node=node,
-                    evidence=tuple(evidence),
-                )
-            )
-        logger.info(
-            "query profile collected",
-            extra={
-                "db": db,
-                "node": node,
-                "profile_entries": len(entries),
-                "collections": sorted(by_collection),
-            },
-        )
-        return signals
+            return None, error
 
     def _worth_carrying(self, record: Mapping[str, Any]) -> bool:
         if "COLLSCAN" in str(record["planSummary"]):
@@ -157,10 +177,10 @@ class QueryProfileCollector(Collector):
 
     @staticmethod
     def _collection_stats(
-        mongo: ReadOnlyMongo, db: str, collection: str
+        reader: ReadOnlyMongo, db: str, collection: str
     ) -> tuple[int | None, float | None]:
         try:
-            stats = mongo.collection_stats(db, collection)
+            stats = reader.collection_stats(db, collection)
         except OperationFailure as exc:
             logger.warning(
                 "collection stats unavailable",
@@ -168,6 +188,79 @@ class QueryProfileCollector(Collector):
             )
             return None, None
         return stats.count, stats.avg_obj_size
+
+    @staticmethod
+    def _mark_unreachable(unreachable: dict[str, str], node: str, exc: BaseException) -> None:
+        unreachable[node] = f"{type(exc).__name__}: {exc}"[:300]
+        logger.warning(
+            "member unreachable during query profile sweep; continuing without it",
+            extra={"node": node, "error": unreachable[node]},
+        )
+
+    # --- signals ------------------------------------------------------------------------
+
+    def _signals(
+        self,
+        members: Sequence[str],
+        unreachable: Mapping[str, str],
+        databases: Sequence[str],
+        levels: Mapping[tuple[str, str], Level],
+        slow: Mapping[tuple[str, str], Mapping[str, list[Record]]],
+        stats: Mapping[tuple[str, str, str], tuple[list[Record], int | None, float | None]],
+    ) -> list[Signal]:
+        swept = [n for n in members if n not in unreachable]
+        missing = [n for n in members if n in unreachable]
+        slow_ms = self._config.slow_ms
+        keyed: list[tuple[tuple[str, str, int], Signal]] = []
+
+        for node in swept:
+            for db in databases:
+                if levels.get((node, db), (None, None))[0] == 0:
+                    signal = Signal(
+                        signal_class=self.signal_class,
+                        source=self.name,
+                        node=node,
+                        evidence=(
+                            Evidence("db", db),
+                            Evidence("profiler_level", 0),
+                            Evidence("slow_ms", slow_ms, "ms"),
+                        ),
+                    )
+                    keyed.append(((db, "", members.index(node)), signal))
+
+        for db, collection in sorted(slow):
+            for node in swept:
+                if (node, db, collection) not in stats:
+                    continue
+                index_stats, count, avg_size = stats[(node, db, collection)]
+                level, status_error = levels.get((node, db), (None, None))
+                records = sorted(
+                    slow[(db, collection)].get(node, []), key=lambda r: (-r["millis"], r["ts"] or "")
+                )
+                evidence = [
+                    Evidence("db", db),
+                    Evidence("collection", collection),
+                    Evidence("profiler_level", level),
+                    Evidence("slow_ms", slow_ms, "ms"),
+                    Evidence("slow_ops_seen", len(records)),
+                    Evidence("ops", records[: self._config.max_ops_per_collection]),
+                    Evidence("index_stats", index_stats),
+                    Evidence("collection_doc_count", count, "docs"),
+                    Evidence("avg_object_size", avg_size, "bytes"),
+                    Evidence("members_swept", swept),
+                    Evidence("members_unreachable", missing),
+                ]
+                if status_error is not None:
+                    evidence.append(Evidence("profiler_status_error", status_error))
+                signal = Signal(
+                    signal_class=self.signal_class,
+                    source=self.name,
+                    node=node,
+                    evidence=tuple(evidence),
+                )
+                keyed.append(((db, collection, members.index(node)), signal))
+
+        return [signal for _, signal in sorted(keyed, key=lambda item: item[0])]
 
 
 def _index_record(doc: Mapping[str, Any]) -> dict[str, Any]:

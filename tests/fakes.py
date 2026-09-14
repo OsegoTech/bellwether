@@ -53,6 +53,8 @@ class FakeCluster:
         self.calls: list[Call] = []
         self.commands: dict[str, CommandHandler] = {"ping": lambda node, doc: {"ok": 1.0}}
         self.collections: dict[str, list[Doc]] = {}
+        # Per-member overrides: node -> namespace -> docs (system.profile is per mongod).
+        self.node_collections: dict[str, dict[str, list[Doc]]] = {}
         self.aggregations: dict[str, AggregateHandler] = {}
 
     def factory(self) -> ClientFactory:
@@ -134,7 +136,12 @@ class FakeCollection:
 
     @property
     def _docs(self) -> list[Doc]:
-        return self.database.client.cluster.collections.get(f"{self.database.name}.{self.name}", [])
+        client = self.database.client
+        namespace = f"{self.database.name}.{self.name}"
+        per_node = client.cluster.node_collections.get(client.node, {})
+        if namespace in per_node:
+            return per_node[namespace]
+        return client.cluster.collections.get(namespace, [])
 
     def find_one(
         self,

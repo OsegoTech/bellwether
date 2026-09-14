@@ -31,7 +31,15 @@ from bellwether.models import ApprovalState, Severity
 from bellwether.mongo import ReadOnlyMongo
 from bellwether.pipeline import run_once
 from bellwether.store.sqlite import SqliteStore
-from tests.fakes import PROVIDER_KEYS, FakeCluster, StaticProvider, oplog_cluster, write_config
+from tests.fakes import (
+    FALLBACKS,
+    PROVIDER_KEYS,
+    TARGET,
+    FakeCluster,
+    StaticProvider,
+    oplog_cluster,
+    write_config,
+)
 
 DB = "meetadev_ledger"
 HEALTHY_OPLOG = 6 * 3600
@@ -174,8 +182,15 @@ def test_profiling_off_is_stored_and_not_analyzed(tmp_path: Path) -> None:
 
     assert claude.calls == 0  # INFO: under the token gate
     assert summary.proposals == []
-    [row] = SqliteStore(config.store.sqlite_path).list_findings(summary.run_id)
-    assert (row.failure_mode, row.severity, row.escalated) == (PROFILER_DISABLED, Severity.INFO, False)
+    rows = SqliteStore(config.store.sqlite_path).list_findings(summary.run_id)
+    # The profiler level is per mongod: one finding for each member with it off.
+    assert sorted(r.node for r in rows) == sorted([TARGET, *FALLBACKS])
+    for row in rows:
+        assert (row.failure_mode, row.severity, row.escalated) == (
+            PROFILER_DISABLED,
+            Severity.INFO,
+            False,
+        )
 
 
 # --- Token gate and dedup ----------------------------------------------------------------

@@ -10,6 +10,7 @@ Spec acceptance (mocked mongo, real profiler-document fixtures):
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,10 +23,21 @@ from bellwether.collectors.base import Collector
 from bellwether.collectors.query_profile import QueryProfileCollector
 from bellwether.config import MongoConfig, QueryProfileCollectorConfig
 from bellwether.models import Signal, SignalClass
-from bellwether.mongo import ReadOnlyMongo
-from tests.fakes import FALLBACKS, READ_URI, TARGET, FakeCluster
+from bellwether.mongo import NoReachableNode, ReadOnlyMongo
+from tests.fakes import (
+    FALLBACKS,
+    READ_URI,
+    SOUTHAFRICA,
+    TARGET,
+    UAE,
+    WESTEUROPE,
+    FakeCluster,
+)
 
 DB = "meetadev_ledger"
+CERT = Path("/etc/bellwether/tls/meetadev-ai.combined.pem")
+MEMBERS = [TARGET, *FALLBACKS]  # hidden backup first, then the voters
+PRIMARY = UAE  # where the application's queries run in these tests
 TS = datetime(2026, 9, 14, 12, 0)  # pymongo returns naive UTC datetimes
 SINCE = datetime(2026, 9, 1)  # $indexStats accesses.since: metadata, may be carried
 FILTER_DATE = datetime(2026, 8, 17)  # a literal inside a query filter: must never be carried
@@ -170,13 +182,14 @@ def cluster_with(
     return cluster
 
 
-def read_client(cluster: FakeCluster) -> ReadOnlyMongo:
+def read_client(cluster: FakeCluster, fallbacks: list[str] | None = None) -> ReadOnlyMongo:
+    """A read client; with no fallbacks the replica set is one member (the target)."""
     config = MongoConfig(
         uri=READ_URI,
         tls_ca_file=Path("/etc/mongodb/tls/ca-chain.cert.pem"),
-        tls_cert_file=Path("/etc/bellwether/tls/meetadev-ai.combined.pem"),
+        tls_cert_file=CERT,
         target_node=TARGET,
-        fallback_nodes=FALLBACKS,
+        fallback_nodes=fallbacks or [],
     )
     return ReadOnlyMongo(config, client_factory=cluster.factory())
 
@@ -450,6 +463,187 @@ def test_it_is_a_performance_collector() -> None:
     assert isinstance(c, Collector)
     assert c.name == "query_profile"
     assert c.signal_class is SignalClass.PERFORMANCE
+
+
+# --- The sweep: traffic-dependent signals are read on every member ---------------------
+
+
+def swept_cluster(
+    *,
+    docs_by_node: dict[str, list[dict[str, Any]]] | None = None,
+    levels: dict[str, int] | None = None,
+    index_ops: dict[str, int] | None = None,
+) -> FakeCluster:
+    """A replica set whose members each keep their own system.profile and index counters."""
+    cluster = cluster_with(docs=[])
+    for node, docs in (docs_by_node if docs_by_node is not None else {PRIMARY: [find_doc()]}).items():
+        cluster.node_collections.setdefault(node, {})[f"{DB}.system.profile"] = docs
+    level_of = levels or {}
+
+    def profile(node: str, doc: dict[str, Any]) -> dict[str, Any]:
+        return {"was": level_of.get(node, 1), "slowms": 100, "ok": 1.0}
+
+    cluster.commands[f"{DB}.profile"] = profile
+    if index_ops is not None:
+        ops_of = index_ops
+
+        def index_stats(node: str, ns: str, pipeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            entry = dict(INDEX_STATS[1])
+            entry["accesses"] = {"ops": Int64(ops_of.get(node, 0)), "since": SINCE}
+            return [entry]
+
+        cluster.aggregations["$indexStats"] = index_stats
+    return cluster
+
+
+def sweep(cluster: FakeCluster, **overrides: Any) -> list[Signal]:
+    return collector(**overrides).collect_signals(read_client(cluster, FALLBACKS))
+
+
+def test_sweep_reads_every_member_and_tags_each_signal_with_its_node() -> None:
+    signals = sweep(swept_cluster())
+
+    assert [s.node for s in signals] == MEMBERS
+    by_node = {s.node: evidence(s) for s in signals}
+    assert [op["millis"] for op in by_node[PRIMARY]["ops"]] == [1840]
+    for node in MEMBERS:
+        ev = by_node[node]
+        assert (ev["db"], ev["collection"]) == (DB, "transactions")
+        assert ev["index_stats"]  # every member reports its own index use
+        assert ev["members_swept"] == MEMBERS
+        assert ev["members_unreachable"] == []
+        if node != PRIMARY:
+            assert ev["ops"] == []
+
+
+def test_sweep_connections_are_direct_read_identity_and_closed() -> None:
+    cluster = swept_cluster()
+
+    sweep(cluster)
+
+    assert cluster.attempted_nodes == MEMBERS
+    for client, node in zip(cluster.clients, MEMBERS):
+        assert client.uri == READ_URI.replace(TARGET, node)
+        assert client.kwargs["directConnection"] is True
+        assert client.kwargs["tlsCertificateKeyFile"] == str(CERT)
+        assert "tlsCertificateKeyFile" not in client.uri
+        assert client.closed
+
+
+def test_sweep_only_ever_reads() -> None:
+    cluster = swept_cluster()
+    profile_commands: list[dict[str, Any]] = []
+
+    def profile(node: str, doc: dict[str, Any]) -> dict[str, Any]:
+        profile_commands.append(doc)
+        return {"was": 1, "slowms": 100, "ok": 1.0}
+
+    cluster.commands[f"{DB}.profile"] = profile
+
+    sweep(cluster)
+
+    assert profile_commands == [{"profile": -1}] * len(MEMBERS)
+    assert {(c.op, c.target) for c in cluster.calls} <= {
+        ("command", "ping"),
+        ("command", "profile"),
+        ("find", "system.profile"),
+        ("aggregate", "$indexStats"),
+        ("aggregate", "$collStats"),
+    }
+
+
+def test_unreachable_member_is_reported_not_fatal(caplog: pytest.LogCaptureFixture) -> None:
+    cluster = swept_cluster()
+    cluster.down.add(WESTEUROPE)
+
+    with caplog.at_level(logging.WARNING, logger="bellwether.collectors"):
+        signals = sweep(cluster)
+
+    assert [s.node for s in signals] == [TARGET, UAE, SOUTHAFRICA]
+    ev = evidence(signals[0])
+    assert ev["members_swept"] == [TARGET, UAE, SOUTHAFRICA]
+    assert ev["members_unreachable"] == [WESTEUROPE]
+    assert any(getattr(r, "node", None) == WESTEUROPE for r in caplog.records)
+
+
+def test_sweep_with_no_reachable_member_raises() -> None:
+    cluster = swept_cluster()
+    cluster.down.update(MEMBERS)
+
+    with pytest.raises(NoReachableNode) as excinfo:
+        sweep(cluster)
+
+    for node in MEMBERS:
+        assert node in str(excinfo.value)
+
+
+def test_sweep_leaves_the_backup_serving_everything_else() -> None:
+    cluster = swept_cluster()
+    cluster.reply("listDatabases", {"databases": [{"name": DB}], "ok": 1.0})
+    reader = read_client(cluster, FALLBACKS)
+
+    collector(databases=[]).collect_signals(reader)
+
+    [listing] = cluster.commands_sent("listDatabases")
+    assert listing.node == TARGET  # not traffic-dependent: the hidden backup answers
+    assert reader.served_by == TARGET
+
+
+def test_each_member_reports_its_own_profiling_level() -> None:
+    signals = sweep(swept_cluster(levels={TARGET: 0}))
+
+    disabled = [s for s in signals if "collection" not in evidence(s)]
+    assert [(s.node, evidence(s)["profiler_level"]) for s in disabled] == [(TARGET, 0)]
+    per_collection = {s.node: evidence(s) for s in signals if "collection" in evidence(s)}
+    assert set(per_collection) == set(MEMBERS)  # the backup's index use still counts
+    assert (per_collection[TARGET]["profiler_level"], per_collection[TARGET]["ops"]) == (0, [])
+
+
+def test_index_use_is_read_from_every_member() -> None:
+    signals = sweep(swept_cluster(index_ops={PRIMARY: 5_000}))
+
+    usage = {s.node: evidence(s)["index_stats"][0]["accesses_ops"] for s in signals}
+    assert usage == {TARGET: 0, WESTEUROPE: 0, UAE: 5_000, SOUTHAFRICA: 0}
+
+
+def test_slow_queries_on_any_member_bring_in_every_members_index_stats() -> None:
+    docs = {PRIMARY: [find_doc(coll="transactions")], SOUTHAFRICA: [find_doc(coll="accounts")]}
+
+    signals = sweep(swept_cluster(docs_by_node=docs))
+
+    pairs = [(evidence(s)["collection"], s.node) for s in signals]
+    assert pairs == [("accounts", n) for n in MEMBERS] + [("transactions", n) for n in MEMBERS]
+
+
+def test_duplicate_members_are_swept_once() -> None:
+    cluster = swept_cluster()
+    config = MongoConfig(
+        uri=READ_URI,
+        tls_ca_file=Path("/etc/mongodb/tls/ca-chain.cert.pem"),
+        tls_cert_file=CERT,
+        target_node=TARGET,
+        fallback_nodes=[WESTEUROPE, TARGET, WESTEUROPE],
+    )
+
+    collector().collect_signals(ReadOnlyMongo(config, client_factory=cluster.factory()))
+
+    assert cluster.attempted_nodes == [TARGET, WESTEUROPE]
+
+
+def test_sweep_logs_each_member_read(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO, logger="bellwether.collectors"):
+        sweep(swept_cluster())
+
+    read = [r for r in caplog.records if r.getMessage() == "query profile read"]
+    assert [getattr(r, "node") for r in read] == MEMBERS
+
+
+def test_no_databases_means_no_sweep() -> None:
+    cluster = swept_cluster()
+    cluster.reply("listDatabases", {"databases": [{"name": "admin"}, {"name": "local"}], "ok": 1.0})
+
+    assert collector(databases=[]).collect_signals(read_client(cluster, FALLBACKS)) == []
+    assert cluster.attempted_nodes == [TARGET]  # only the serving connection, for the listing
 
 
 @pytest.mark.parametrize("bad", [0, 1001])

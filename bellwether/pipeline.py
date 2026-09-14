@@ -5,10 +5,11 @@
 
 Every finding is stored. Only findings at or above
 ``analysis.escalate_min_severity`` reach the analyst (the token gate), and a
-finding already covered by a PENDING proposal for the same failure mode and
-node — and the same subject, for findings that carry one (one query shape,
-one index) — is not re-analyzed, so a persistent condition does not spawn a
-proposal per timer tick.
+finding already covered by a PENDING proposal is not re-analyzed, so a
+persistent condition does not spawn a proposal per timer tick. "Covered" means
+the same failure mode on the same node — or, for findings that carry a
+subject (one query shape, one index, which belong to the whole replica set),
+the same failure mode and subject on any member.
 
 Collectors: the oplog window and the query profile (the Index Advisor's
 input). Detectors: the oplog window and the Index Advisor. If analysis is unavailable the finding stays recorded

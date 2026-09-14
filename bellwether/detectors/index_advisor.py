@@ -4,7 +4,8 @@ Performance Advisor, deterministic.
 From ``query_profile`` signals it finds three failure modes:
 
 ``profiler_disabled`` (INFO)
-    Profiling is off on a database, so its slow queries cannot be analysed.
+    Profiling is off on a database on a member (the level is per mongod), so
+    that member's slow queries cannot be analysed.
 
 ``missing_index_collscan`` (WARNING, or CRITICAL past the high bars)
     A query shape reads more than ``targeting_ratio_threshold`` documents per
@@ -16,26 +17,32 @@ From ``query_profile`` signals it finds three failure modes:
 
 ``redundant_index`` (INFO)
     An index that is a strict prefix of another index, or one with no
-    accesses over at least ``min_unused_index_age_seconds`` of statistics.
-    Never ``_id``, a unique index (it backs a constraint), a TTL index (the TTL
-    monitor's deletes are not counted as accesses), or a hidden one. A replica
-    set has no shard key, so none is excluded for that. Dropping is always a
-    human decision.
+    accesses on any member over at least ``min_unused_index_age_seconds`` of
+    statistics. Never ``_id``, a unique index (it backs a constraint), a TTL
+    index (the TTL monitor's deletes are not counted as accesses), or a hidden
+    one. A replica set has no shard key, so none is excluded for that.
+    Dropping is always a human decision.
+
+**Members are merged per collection.** The collector sweeps every member,
+because the profiler and index counters are per mongod. A collection's ops
+from all members are pooled into one finding per query shape, placed on the
+member where that shape wastes most. An index is called unused only if it
+has zero accesses on *every* member, every member's counters have run long
+enough (the youngest decides), and no member was unreachable: an index busy
+on the primary is not unused because the backup never touched it.
 
 An existing index **supports** a shape when its leading fields are the
 candidate's equality fields (any order, any direction), then its sort fields
 in order (directions as given or all reversed), then its range fields — i.e.
 it is the candidate up to ESR-equivalent reordering, possibly with more fields
 after. Hidden, partial, and sparse indexes are never counted as supporting.
-
-``$indexStats`` counters and the profiler are per mongod: both describe the
-member they were read from, which each finding names as its node.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, ClassVar
 
@@ -48,7 +55,6 @@ from bellwether.detectors.query_shape import (
     ShapeImpact,
     build_candidate,
     equality_frequency,
-    group_by_shape,
     impact,
     rank_impacts,
     shape_of,
@@ -60,6 +66,28 @@ logger = logging.getLogger(__name__)
 PROFILER_DISABLED = "profiler_disabled"
 MISSING_INDEX_COLLSCAN = "missing_index_collscan"
 REDUNDANT_INDEX = "redundant_index"
+
+
+@dataclass(frozen=True)
+class _CollectionView:
+    """One collection as every swept member reported it."""
+
+    db: str
+    collection: str
+    nodes: tuple[str, ...]  # members that reported it, in sweep order
+    ops: tuple[tuple[str, Mapping[str, Any]], ...]  # (member, redacted op)
+    indexes: tuple[dict[str, Any], ...]  # merged across members by name
+    doc_count: int | None
+    avg_object_size: float | None
+    profiler_levels: dict[str, Any]
+    slow_ms: Any
+    unreachable: tuple[str, ...]
+    collected_at: datetime
+    signals: tuple[Signal, ...]
+
+    @property
+    def namespace(self) -> str:
+        return f"{self.db}.{self.collection}"
 
 
 class IndexAdvisorDetector(Detector):
@@ -81,21 +109,28 @@ class IndexAdvisorDetector(Detector):
 
     def evaluate_all(self, signals: Sequence[Signal]) -> list[Finding]:
         """Missing-index findings by Impact (capped), then profiler-disabled, then redundant."""
-        missing: dict[str, Finding] = {}
-        impacts: list[ShapeImpact] = []
         disabled: list[Finding] = []
-        redundant: list[Finding] = []
+        grouped: dict[tuple[str, str], list[tuple[Signal, dict[str, Any]]]] = {}
         for signal in signals:
             if signal.source != "query_profile":
                 continue
             evidence = {e.name: e.value for e in signal.evidence}
-            if evidence.get("profiler_level") == 0:
-                disabled.append(self._profiler_disabled(signal, evidence))
+            if "collection" not in evidence:
+                if evidence.get("profiler_level") == 0:
+                    disabled.append(self._profiler_disabled(signal, evidence))
                 continue
-            for result, finding in self._missing_indexes(signal, evidence):
+            key = (str(evidence.get("db")), str(evidence.get("collection")))
+            grouped.setdefault(key, []).append((signal, evidence))
+
+        missing: dict[str, Finding] = {}
+        impacts: list[ShapeImpact] = []
+        redundant: list[Finding] = []
+        for members in grouped.values():
+            view = _merge(members)
+            for result, finding in self._missing_indexes(view):
                 impacts.append(result)
                 missing[result.shape_key] = finding
-            redundant.extend(self._redundant_indexes(signal, evidence))
+            redundant.extend(self._redundant_indexes(view))
 
         top = [missing[i.shape_key] for i in rank_impacts(impacts)][: self._config.max_suggestions]
         findings = [*top, *disabled, *redundant]
@@ -135,56 +170,57 @@ class IndexAdvisorDetector(Detector):
 
     # --- missing_index_collscan -------------------------------------------------
 
-    def _missing_indexes(
-        self, signal: Signal, evidence: Mapping[str, Any]
-    ) -> Iterator[tuple[ShapeImpact, Finding]]:
+    def _missing_indexes(self, view: _CollectionView) -> Iterator[tuple[ShapeImpact, Finding]]:
         cfg = self._config
-        records = [r for r in evidence.get("ops") or [] if isinstance(r, Mapping)]
-        groups = group_by_shape(records)
-        shapes = {key: shape_of(ops[0]) for key, ops in groups.items()}
+        by_shape: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
+        for node, record in view.ops:
+            by_shape.setdefault(shape_of(record).key, []).append((node, record))
+        shapes = {key: shape_of(pairs[0][1]) for key, pairs in by_shape.items()}
         frequency = equality_frequency(shapes.values())
-        existing = [i for i in evidence.get("index_stats") or [] if isinstance(i, Mapping)]
-        for key, ops in groups.items():
+        for key, pairs in by_shape.items():
             shape = shapes[key]
             candidate = build_candidate(shape, frequency)
             if not candidate.keys:
                 continue  # nothing a compound index could serve
-            result = impact(ops, avg_object_size=evidence.get("avg_object_size"))
+            result = impact([r for _, r in pairs], avg_object_size=view.avg_object_size)
             if (
                 result.targeting_ratio < cfg.targeting_ratio_threshold
                 or result.wasted_bytes < cfg.wasted_bytes_floor
             ):
                 continue
-            if any(_supports(index, candidate) for index in existing):
+            if any(_supports(index, candidate) for index in view.indexes):
                 continue
-            yield result, self._missing_index_finding(
-                signal, evidence, shape, candidate, result, existing
-            )
+            yield result, self._missing_index_finding(view, shape, candidate, result, pairs)
 
     def _missing_index_finding(
         self,
-        signal: Signal,
-        evidence: Mapping[str, Any],
+        view: _CollectionView,
         shape: QueryShape,
         candidate: Candidate,
         result: ShapeImpact,
-        existing: Sequence[Mapping[str, Any]],
+        pairs: Sequence[tuple[str, Mapping[str, Any]]],
     ) -> Finding:
         cfg = self._config
-        db, collection = str(evidence.get("db")), str(evidence.get("collection"))
-        namespace = f"{db}.{collection}"
+        observed = {n: sum(1 for node, _ in pairs if node == n) for n in view.nodes}
+        observed = {n: count for n, count in observed.items() if count}
+        waste = {
+            n: impact([r for node, r in pairs if node == n], view.avg_object_size).wasted_bytes
+            for n in observed
+        }
+        busiest = min(observed, key=lambda n: (-waste[n], view.nodes.index(n)))
         critical = (
             result.targeting_ratio >= cfg.critical_targeting_ratio
             and result.wasted_bytes >= cfg.critical_wasted_bytes
         )
         items = [
-            Evidence("db", db),
-            Evidence("collection", collection),
-            Evidence("namespace", namespace),
-            Evidence("subject", f"{namespace}#{shape.key}"),
+            Evidence("db", view.db),
+            Evidence("collection", view.collection),
+            Evidence("namespace", view.namespace),
+            Evidence("subject", f"{view.namespace}#{shape.key}"),
             Evidence("shape_key", shape.key),
             Evidence("query_shape", shape.as_evidence()),
             Evidence("op_count", result.op_count),
+            Evidence("observed_on", observed),
             Evidence("targeting_ratio", round(result.targeting_ratio, 1)),
             Evidence("docs_examined", result.total_docs_examined, "docs"),
             Evidence("docs_returned", result.total_docs_returned, "docs"),
@@ -196,16 +232,18 @@ class IndexAdvisorDetector(Detector):
             Evidence("candidate_index", candidate.as_evidence()),
             Evidence(
                 "existing_indexes",
-                [{"name": i.get("name"), "key": list(i.get("key") or [])} for i in existing],
+                [{"name": i.get("name"), "key": list(i.get("key") or [])} for i in view.indexes],
             ),
-            Evidence("collection_doc_count", evidence.get("collection_doc_count"), "docs"),
-            Evidence("profiler_level", evidence.get("profiler_level")),
-            Evidence("slow_ms", evidence.get("slow_ms"), "ms"),
+            Evidence("collection_doc_count", view.doc_count, "docs"),
+            Evidence("members", list(view.nodes)),
+            Evidence("members_unreachable", list(view.unreachable)),
+            Evidence("profiler_levels", view.profiler_levels),
+            Evidence("slow_ms", view.slow_ms, "ms"),
         ]
         if candidate.dropped:
             items.append(Evidence("candidate_index_dropped_fields", list(candidate.dropped)))
         summary = (
-            f"Query shape {_shape_text(shape)} on {namespace} examined "
+            f"Query shape {_shape_text(shape)} on {view.namespace} examined "
             f"{result.total_docs_examined:,} documents to return {result.total_docs_returned:,} "
             f"({result.targeting_ratio:,.0f} per document returned) across {result.op_count} "
             f"slow op(s), about {_bytes_text(result.wasted_bytes)} read for nothing; no existing "
@@ -215,53 +253,54 @@ class IndexAdvisorDetector(Detector):
             signal_class=SignalClass.PERFORMANCE,
             failure_mode=MISSING_INDEX_COLLSCAN,
             severity=Severity.CRITICAL if critical else Severity.WARNING,
-            node=signal.node,
+            node=busiest,
             summary=summary,
             evidence=tuple(items),
-            signals=(signal,),
+            signals=view.signals,
         )
 
     # --- redundant_index ----------------------------------------------------------
 
-    def _redundant_indexes(self, signal: Signal, evidence: Mapping[str, Any]) -> Iterator[Finding]:
-        indexes = [i for i in evidence.get("index_stats") or [] if isinstance(i, Mapping)]
+    def _redundant_indexes(self, view: _CollectionView) -> Iterator[Finding]:
+        indexes = list(view.indexes)
         for index in indexes:
             if _protected(index):
                 continue
             covering = _covering_index(index, indexes)
-            age = _stats_age_seconds(index, signal.collected_at)
+            age = _stats_age_seconds(index, view.collected_at)
             if covering is not None:
-                yield self._redundant_finding(signal, evidence, index, "prefix", age, covering)
+                yield self._redundant_finding(view, index, "prefix", age, covering)
             elif (
                 int(index.get("accesses_ops") or 0) == 0
+                and index.get("seen_on_every_member")
+                and not view.unreachable
                 and age is not None
                 and age >= self._config.min_unused_index_age_seconds
             ):
-                yield self._redundant_finding(signal, evidence, index, "unused", age, None)
+                yield self._redundant_finding(view, index, "unused", age, None)
 
     def _redundant_finding(
         self,
-        signal: Signal,
-        evidence: Mapping[str, Any],
+        view: _CollectionView,
         index: Mapping[str, Any],
         reason: str,
         age: int | None,
         covering: Mapping[str, Any] | None,
     ) -> Finding:
-        db, collection = str(evidence.get("db")), str(evidence.get("collection"))
-        namespace = f"{db}.{collection}"
         name = str(index.get("name"))
         key = list(index.get("key") or [])
         items = [
-            Evidence("db", db),
-            Evidence("collection", collection),
-            Evidence("namespace", namespace),
-            Evidence("subject", f"{namespace}#{name}"),
+            Evidence("db", view.db),
+            Evidence("collection", view.collection),
+            Evidence("namespace", view.namespace),
+            Evidence("subject", f"{view.namespace}#{name}"),
             Evidence("index_name", name),
             Evidence("index_key", key),
             Evidence("accesses_ops", int(index.get("accesses_ops") or 0)),
+            Evidence("accesses_by_node", dict(index.get("accesses_by_node") or {})),
             Evidence("accesses_since", index.get("accesses_since")),
             Evidence("index_stats_age_seconds", age, "s"),
+            Evidence("members", list(view.nodes)),
             Evidence("reason", reason),
         ]
         if covering is not None:
@@ -269,26 +308,101 @@ class IndexAdvisorDetector(Detector):
             cover_key: list[Mapping[str, Any]] = list(covering.get("key") or [])
             items.append(Evidence("covering_index", {"name": cover_name, "key": cover_key}))
             summary = (
-                f"Index {name} {_record_keys_text(key)} on {namespace} is a prefix of "
+                f"Index {name} {_record_keys_text(key)} on {view.namespace} is a prefix of "
                 f"{cover_name} {_record_keys_text(cover_key)}, which serves the same "
                 "queries; it costs write throughput and disk for no read benefit."
             )
         else:
             days = (age or 0) // 86_400
             summary = (
-                f"Index {name} {_record_keys_text(key)} on {namespace} has had no accesses "
-                f"since {index.get('accesses_since')} ({days} days of index statistics on "
-                f"{signal.node}); every write still maintains it."
+                f"Index {name} {_record_keys_text(key)} on {view.namespace} has had no "
+                f"accesses on any of the {len(view.nodes)} member(s) swept since "
+                f"{index.get('accesses_since')} ({days} days of index statistics); every write "
+                "still maintains it."
             )
         return Finding(
             signal_class=SignalClass.PERFORMANCE,
             failure_mode=REDUNDANT_INDEX,
             severity=Severity.INFO,
-            node=signal.node,
+            node=view.nodes[0],
             summary=summary,
             evidence=tuple(items),
-            signals=(signal,),
+            signals=view.signals,
         )
+
+
+def _merge(members: Sequence[tuple[Signal, Mapping[str, Any]]]) -> _CollectionView:
+    """One collection's signals from every member, merged."""
+    first = members[0][1]
+    nodes: list[str] = []
+    ops: list[tuple[str, Mapping[str, Any]]] = []
+    merged: dict[str, dict[str, Any]] = {}
+    since_by_index: dict[str, list[Any]] = {}
+    counts: list[int] = []
+    sizes: list[float] = []
+    levels: dict[str, Any] = {}
+    unreachable: list[str] = []
+    for signal, evidence in members:
+        node = signal.node
+        if node not in nodes:
+            nodes.append(node)
+        ops.extend((node, r) for r in evidence.get("ops") or [] if isinstance(r, Mapping))
+        for index in evidence.get("index_stats") or []:
+            if not isinstance(index, Mapping):
+                continue
+            name = str(index.get("name"))
+            entry = merged.setdefault(name, {**index, "accesses_ops": 0, "accesses_by_node": {}})
+            accesses = int(index.get("accesses_ops") or 0)
+            entry["accesses_ops"] += accesses
+            entry["accesses_by_node"][node] = accesses
+            since_by_index.setdefault(name, []).append(index.get("accesses_since"))
+        count = evidence.get("collection_doc_count")
+        if isinstance(count, int) and not isinstance(count, bool):
+            counts.append(count)
+        size = evidence.get("avg_object_size")
+        if isinstance(size, (int, float)) and size:
+            sizes.append(float(size))
+        levels[node] = evidence.get("profiler_level")
+        unreachable.extend(n for n in evidence.get("members_unreachable") or [] if n not in unreachable)
+    for name, entry in merged.items():
+        # The youngest counters decide how long "no accesses" has been observed.
+        entry["accesses_since"] = _latest(since_by_index[name])
+        entry["seen_on_every_member"] = set(entry["accesses_by_node"]) == set(nodes)
+    return _CollectionView(
+        db=str(first.get("db")),
+        collection=str(first.get("collection")),
+        nodes=tuple(nodes),
+        ops=tuple(ops),
+        indexes=tuple(merged.values()),
+        doc_count=max(counts) if counts else None,
+        avg_object_size=sizes[0] if sizes else None,
+        profiler_levels=levels,
+        slow_ms=first.get("slow_ms"),
+        unreachable=tuple(unreachable),
+        collected_at=max(signal.collected_at for signal, _ in members),
+        signals=tuple(signal for signal, _ in members),
+    )
+
+
+def _latest(stamps: Sequence[Any]) -> str | None:
+    """The most recent ISO timestamp, or None if any is missing or unreadable."""
+    parsed: list[tuple[datetime, str]] = []
+    for stamp in stamps:
+        moment = _parse(stamp)
+        if moment is None:
+            return None
+        parsed.append((moment, str(stamp)))
+    return max(parsed)[1] if parsed else None
+
+
+def _parse(stamp: Any) -> datetime | None:
+    if not isinstance(stamp, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def _supports(index: Mapping[str, Any], candidate: Candidate) -> bool:
@@ -349,15 +463,9 @@ def _ordered_keys(index: Mapping[str, Any]) -> list[tuple[str, int]]:
 
 
 def _stats_age_seconds(index: Mapping[str, Any], now: datetime) -> int | None:
-    since = index.get("accesses_since")
-    if not isinstance(since, str):
+    moment = _parse(index.get("accesses_since"))
+    if moment is None:
         return None
-    try:
-        moment = datetime.fromisoformat(since)
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
     reference = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
     return int((reference - moment).total_seconds())
 

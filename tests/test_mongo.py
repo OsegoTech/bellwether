@@ -206,6 +206,8 @@ READ_API = {
     "current_op_all_nodes",
     "profiling_status",
     "collection_stats",
+    "members",
+    "member_reader",
     "served_by",
     "close",
 }
@@ -385,6 +387,45 @@ def test_collection_stats_of_an_empty_collection(cluster: FakeCluster) -> None:
     stats = client_for(cluster).collection_stats("meetadev_ledger", "empty")
 
     assert (stats.count, stats.avg_obj_size) == (0, None)
+
+
+# --- Member readers: the query-profile sweep's per-member clients ---------------------
+
+
+def test_members_lists_the_target_then_fallbacks_once(cluster: FakeCluster) -> None:
+    mongo = client_for(cluster, fallback_nodes=[WESTEUROPE, TARGET, UAE])
+
+    assert mongo.members() == [TARGET, WESTEUROPE, UAE]
+
+
+def test_member_reader_is_pinned_to_one_member(cluster: FakeCluster) -> None:
+    cluster.down.add(TARGET)
+    reader = client_for(cluster).member_reader(TARGET)
+
+    with pytest.raises(NoReachableNode):
+        reader.server_status()  # no fallback: a pinned reader never wanders
+
+    assert cluster.attempted_nodes == [TARGET]
+
+
+def test_member_reader_uses_the_read_identity_directly(cluster: FakeCluster) -> None:
+    reader = client_for(cluster).member_reader(UAE)
+
+    reader.rs_status()
+
+    [client] = cluster.clients
+    assert isinstance(reader, ReadOnlyMongo)  # the same read-only surface, nothing more
+    assert reader.served_by == UAE
+    assert client.uri == READ_URI.replace(TARGET, UAE)
+    assert client.kwargs["directConnection"] is True
+    assert client.kwargs["tlsCertificateKeyFile"] == str(CERT)
+    reader.close()
+    assert client.closed
+
+
+def test_member_reader_refuses_hosts_outside_the_config(cluster: FakeCluster) -> None:
+    with pytest.raises(ValueError, match="not a configured member"):
+        client_for(cluster).member_reader("mongo.attacker.example:27017")
 
 
 # --- The one exception: cluster-wide currentOp ---------------------------------------

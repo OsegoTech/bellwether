@@ -13,16 +13,27 @@ Two rules, enforced in code (BUILD_SPEC §3.3):
    everything else before a connection is even opened. The underlying
    ``MongoClient`` is private and never handed out.
 
-One deliberate exception to the single-node default:
-``current_op_all_nodes`` runs ``$currentOp`` on every configured member
-(backup target and voters), each over its own short-lived direct connection.
-An operation is visible only on the mongod running it — a runaway query on
-the primary never appears in the backup node's currentOp — and killOp must be
-sent to that same member. Finding a killable op therefore means looking where
-ops actually run. The exception is narrow: it is the only helper that leaves
-the serving node, it issues nothing but ``$currentOp`` (a read, allowed by
-clusterMonitor's inprog privilege), it uses the same read identity and TLS
-material, and it leaves the serving connection untouched.
+One deliberate exception to the single-node default, in two instances. Most
+diagnostics come from the hidden backup node, sparing the voters. But a signal
+that depends on traffic exists only on the member that served the traffic, so
+it must be read where the traffic is:
+
+1. ``current_op_all_nodes`` runs ``$currentOp`` on every configured member.
+   An operation is visible only on the mongod running it — a runaway query on
+   the primary never appears in the backup node's currentOp — and killOp must
+   be sent to that same member.
+2. ``member_reader(node)`` pins a read client to one member for the
+   query-profile sweep: each member's profiler (``system.profile`` and its
+   level), ``$indexStats`` and ``$collStats``. The application's queries run
+   on the primary; read only from the backup, the profiler would be empty and
+   every index would look unused.
+
+Both are narrow and read-only. They reach only configured members, each over
+its own short-lived direct connection, with the same read identity and TLS
+material; a member reader is this same class, so it has these read helpers and
+nothing else; and the serving connection every other read uses is untouched.
+Whatever is not traffic-dependent — oplog stats, replica-set status, the list
+of databases — stays on the backup node.
 
 Identity is ``meetadev-ai`` (clusterMonitor@admin, read@local,
 read@meetadev_ledger). TLS material reaches ``MongoClient`` as keyword
@@ -237,6 +248,23 @@ class ReadOnlyMongo:
             avg_obj_size=_opt_float(storage.get("avgObjSize")) or None,
             size_bytes=int(storage.get("size", 0)),
         )
+
+    def members(self) -> list[str]:
+        """Configured members in order — target first, then fallbacks — once each."""
+        return self._members()
+
+    def member_reader(self, node: str) -> ReadOnlyMongo:
+        """A read client pinned to one configured member, with no fallback.
+
+        The second instance of the deliberate exception (module docstring):
+        the query-profile sweep reads each member's profiler and index use
+        through these. Same class, same read identity and TLS material, so the
+        same read-only helpers and nothing more; only configured members.
+        """
+        if node not in self._members():
+            raise ValueError(f"{node!r} is not a configured member")
+        pinned = self._config.model_copy(update={"target_node": node, "fallback_nodes": []})
+        return ReadOnlyMongo(pinned, client_factory=self._factory)
 
     def current_op(self, filter: Mapping[str, Any] | None = None) -> list[Doc]:
         """In-progress operations on the serving node only."""

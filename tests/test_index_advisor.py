@@ -113,12 +113,15 @@ def profile_signal(
     count: int | None = 2_400_000,
     avg: float | None = 436.0,
     collection: str = COLL,
+    node: str = NODE,
+    swept: list[str] | None = None,
+    unreachable: list[str] | None = None,
 ) -> Signal:
     carried = [op()] if ops is None else ops
     return Signal(
         signal_class=SignalClass.PERFORMANCE,
         source="query_profile",
-        node=NODE,
+        node=node,
         evidence=(
             Evidence("db", DB),
             Evidence("collection", collection),
@@ -129,16 +132,18 @@ def profile_signal(
             Evidence("index_stats", [ID_INDEX] if indexes is None else indexes),
             Evidence("collection_doc_count", count, "docs"),
             Evidence("avg_object_size", avg, "bytes"),
+            Evidence("members_swept", swept if swept is not None else [node]),
+            Evidence("members_unreachable", unreachable or []),
         ),
         collected_at=NOW,
     )
 
 
-def disabled_signal(db: str = DB) -> Signal:
+def disabled_signal(db: str = DB, node: str = NODE) -> Signal:
     return Signal(
         signal_class=SignalClass.PERFORMANCE,
         source="query_profile",
-        node=NODE,
+        node=node,
         evidence=(Evidence("db", db), Evidence("profiler_level", 0), Evidence("slow_ms", 100, "ms")),
         collected_at=NOW,
     )
@@ -395,6 +400,115 @@ def test_an_over_wide_shape_reports_the_fields_cut() -> None:
 
 def test_unknown_profiler_level_still_analyses_the_ops() -> None:
     assert of_mode(run(profile_signal(level=None)), MISSING_INDEX_COLLSCAN)
+
+
+# --- Members: signals from every node are merged per collection ----------------------------
+
+PRIMARY = "node-uae.mongo.internal:27017"
+SECONDARY = "node-westeurope.mongo.internal:27017"
+PAIR = [NODE, PRIMARY]
+
+
+def test_one_shape_on_several_members_is_one_finding_on_the_busiest() -> None:
+    signals = [
+        profile_signal([op(examined=200_000, returned=100)], node=NODE, swept=PAIR),
+        profile_signal([op(examined=1_000_000, returned=900)], node=PRIMARY, swept=PAIR),
+    ]
+
+    [finding] = of_mode(run(*signals), MISSING_INDEX_COLLSCAN)
+
+    assert finding.node == PRIMARY  # where the waste is
+    e = ev(finding)
+    assert e["op_count"] == 2
+    assert (e["docs_examined"], e["docs_returned"]) == (1_200_000, 1_000)
+    assert e["observed_on"] == {NODE: 1, PRIMARY: 1}
+    assert len(finding.signals) == 2
+
+
+def test_an_index_used_on_any_member_is_not_unused() -> None:
+    legacy_unused = index("legacy_status_1", [("status", 1)], ops=0)
+    legacy_used = index("legacy_status_1", [("status", 1)], ops=500)
+    signals = [
+        profile_signal(indexes=[ID_INDEX, legacy_unused], node=NODE, swept=PAIR),
+        profile_signal(indexes=[ID_INDEX, legacy_used], node=PRIMARY, swept=PAIR),
+    ]
+
+    assert of_mode(run(*signals), REDUNDANT_INDEX) == []
+
+
+def test_an_index_unused_on_every_member_is_redundant_once() -> None:
+    legacy = index("legacy_status_1", [("status", 1)], ops=0)
+    signals = [
+        profile_signal(indexes=[ID_INDEX, legacy], node=NODE, swept=PAIR),
+        profile_signal(indexes=[ID_INDEX, legacy], node=PRIMARY, swept=PAIR),
+    ]
+
+    [finding] = of_mode(run(*signals), REDUNDANT_INDEX)
+
+    e = ev(finding)
+    assert e["accesses_ops"] == 0
+    assert e["accesses_by_node"] == {NODE: 0, PRIMARY: 0}
+    assert e["members"] == PAIR
+
+
+def test_an_index_is_not_called_unused_while_a_member_is_unreachable() -> None:
+    legacy = index("legacy_status_1", [("status", 1)], ops=0)
+    signals = [
+        profile_signal(indexes=[ID_INDEX, legacy], node=NODE, swept=PAIR, unreachable=[SECONDARY]),
+        profile_signal(indexes=[ID_INDEX, legacy], node=PRIMARY, swept=PAIR, unreachable=[SECONDARY]),
+    ]
+
+    assert of_mode(run(*signals), REDUNDANT_INDEX) == []
+
+
+def test_an_index_missing_from_a_members_stats_is_not_called_unused() -> None:
+    legacy = index("legacy_status_1", [("status", 1)], ops=0)
+    signals = [
+        profile_signal(indexes=[ID_INDEX, legacy], node=NODE, swept=PAIR),
+        profile_signal(indexes=[ID_INDEX], node=PRIMARY, swept=PAIR),  # still building there
+    ]
+
+    assert of_mode(run(*signals), REDUNDANT_INDEX) == []
+
+
+def test_the_youngest_counters_decide_whether_an_index_is_unused() -> None:
+    signals = [
+        profile_signal(indexes=[index("legacy", [("s", 1)], ops=0, since=OLD)], node=NODE, swept=PAIR),
+        profile_signal(indexes=[index("legacy", [("s", 1)], ops=0, since=RECENT)], node=PRIMARY, swept=PAIR),
+    ]
+
+    assert of_mode(run(*signals), REDUNDANT_INDEX) == []  # the primary restarted 36 hours ago
+
+
+def test_a_prefix_index_seen_on_every_member_is_reported_once() -> None:
+    indexes = [ID_INDEX, index("a_1", [("a", 1)]), index("a_1_b_1", [("a", 1), ("b", 1)])]
+    signals = [
+        profile_signal(indexes=indexes, node=NODE, swept=PAIR),
+        profile_signal(indexes=indexes, node=PRIMARY, swept=PAIR),
+    ]
+
+    assert [ev(f)["index_name"] for f in of_mode(run(*signals), REDUNDANT_INDEX)] == ["a_1"]
+
+
+def test_a_collection_signal_with_profiling_off_is_merged_not_disabled() -> None:
+    signals = [
+        profile_signal([], node=NODE, level=0, swept=PAIR),  # the backup: profiler off, index stats in
+        profile_signal(node=PRIMARY, swept=PAIR),
+    ]
+
+    findings = run(*signals)
+
+    assert of_mode(findings, PROFILER_DISABLED) == []
+    assert of_mode(findings, MISSING_INDEX_COLLSCAN)
+
+
+def test_profiler_disabled_is_reported_per_member() -> None:
+    findings = run(disabled_signal(node=NODE), disabled_signal(node=PRIMARY))
+
+    assert [(f.failure_mode, f.node) for f in findings] == [
+        (PROFILER_DISABLED, NODE),
+        (PROFILER_DISABLED, PRIMARY),
+    ]
 
 
 # --- Shape of the result ------------------------------------------------------------------

@@ -381,6 +381,22 @@ def test_has_pending_can_be_narrowed_to_a_subject(store: SqliteStore) -> None:
     assert not store.has_pending("missing_index_collscan", NODE, subject="meetadev_ledger.transactions#bbbb")
 
 
+def test_a_subject_identifies_the_finding_whatever_the_node(store: SqliteStore) -> None:
+    # A query shape or an index belongs to the replica set: the member a finding
+    # was placed on can change between runs without it being a new finding.
+    proposal = make_proposal(
+        failure_mode="missing_index_collscan",
+        node="node-uae.mongo.internal:27017",
+        evidence_refs=(Evidence("subject", "meetadev_ledger.transactions#aaaa", observed_at=T0),),
+    )
+    store.record_proposal(proposal)
+
+    assert store.has_pending(
+        "missing_index_collscan", NODE, subject="meetadev_ledger.transactions#aaaa"
+    )
+    assert not store.has_pending("missing_index_collscan", NODE)  # no subject: node still counts
+
+
 def test_findings_are_recorded(store: SqliteStore) -> None:
     finding = make_finding()
 

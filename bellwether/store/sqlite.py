@@ -277,18 +277,22 @@ class SqliteStore:
         return [p for p, record in self.list_proposals() if record.state is ApprovalState.PENDING]
 
     def has_pending(self, failure_mode: str, node: str, subject: str | None = None) -> bool:
-        """Whether an undecided proposal already covers this failure mode on this node.
+        """Whether an undecided proposal already covers this finding.
 
-        With `subject` (a finding's ``subject`` evidence — one query shape, one
-        index), only a pending proposal for that same subject counts: a node can
-        carry many index findings at once, and each deserves its own proposal.
+        Without `subject`: any pending proposal for this failure mode on this
+        node. With `subject` (a finding's ``subject`` evidence — one query shape,
+        one index), a pending proposal for that same subject, whatever member it
+        was placed on: a shape or an index belongs to the whole replica set, and
+        each one deserves exactly one open proposal.
         """
+        if subject is not None:
+            matches = self._proposals_where("WHERE failure_mode = ?", (failure_mode,))
+            return any(
+                record.state is ApprovalState.PENDING and _subject(proposal) == subject
+                for proposal, record in matches
+            )
         matches = self._proposals_where("WHERE failure_mode = ? AND node = ?", (failure_mode, node))
-        return any(
-            record.state is ApprovalState.PENDING
-            and (subject is None or _subject(proposal) == subject)
-            for proposal, record in matches
-        )
+        return any(record.state is ApprovalState.PENDING for _, record in matches)
 
     # --- findings and runs --------------------------------------------------------
 
