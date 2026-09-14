@@ -1,0 +1,60 @@
+# Bellwether example configuration — grounded in the rs0 cluster (BUILD_SPEC §1).
+#
+# Every value here can be overridden by an env var: BELLWETHER_<SECTION>__<KEY>,
+# e.g. BELLWETHER_PROMETHEUS__BASE_URL. Lists take JSON:
+#   BELLWETHER_MONGO__FALLBACK_NODES='["node-uae.mongo.internal:27017"]'
+#
+# SECRETS NEVER GO IN THIS FILE. A secret key found here is a load-time error.
+# Required at load time for the features enabled below:
+#   BELLWETHER_ANALYSIS__ANTHROPIC_API_KEY    (claude is a provider)
+#   BELLWETHER_ANALYSIS__OPENAI_API_KEY       (openai is a provider)
+#   BELLWETHER_NOTIFY__SLACK_WEBHOOK_URL      (slack is a channel)
+#   BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET   (slack is a channel)
+# Optional:
+#   BELLWETHER_MONGO__TLS_CERT_KEY_PASSWORD   (only if the client key is encrypted)
+
+mongo:
+  # Read identity meetadev-ai (clusterMonitor@admin, read@local,
+  # read@meetadev_ledger). X.509 over mutual TLS; hostname verification stays on.
+  # In a systemd unit, write %24external as %%24external.
+  uri: "mongodb://node-backup.mongo.internal:27017/?authMechanism=MONGODB-X509&authSource=%24external&tls=true"
+  tls_ca_file: /etc/mongodb/tls/ca-chain.cert.pem
+  tls_cert_file: /etc/bellwether/tls/meetadev-ai.combined.pem   # cert + key, one PEM
+  # Hidden, non-voting, priority-0 member: diagnostic reads never land on the primary.
+  target_node: node-backup.mongo.internal:27017
+  # Tried in order if the target is unreachable.
+  fallback_nodes:
+    - node-uae.mongo.internal:27017
+    - node-southafrica.mongo.internal:27017
+    - node-westeurope.mongo.internal:27017
+
+prometheus:
+  enabled: true
+  base_url: http://10.3.2.4:9090
+
+analysis:
+  primary_provider: claude
+  fallback_provider: openai      # or null to run Claude-only
+  claude_model: claude-opus-5
+  openai_model: gpt-5
+  max_retries: 1                 # retries after the first attempt, per provider
+  timeout_seconds: 60
+  escalate_min_severity: warning # info | warning | critical
+
+notify:
+  channels:
+    - stdout
+    - slack
+
+store:
+  sqlite_path: /var/lib/bellwether/bellwether.db
+
+executor:
+  # Write identity meetadev-ai-exec — distinct from the read identity above.
+  # Off until an operator deliberately turns it on.
+  enabled: false
+  mongo_uri: null
+  # The whitelist is fixed in code; config can only narrow it.
+  allowed_actions:
+    - kill_op
+    - create_small_index
