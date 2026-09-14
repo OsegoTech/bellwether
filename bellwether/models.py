@@ -125,7 +125,8 @@ class Finding:
     node: str
     summary: str                      # one deterministic sentence, no AI
     evidence: tuple[Evidence, ...]
-    horizon_seconds: int | None = None  # est. time to impact; None if not time-bound
+    # est. time to impact; 0 = threshold already crossed; None if not time-bound
+    horizon_seconds: int | None = None
     signals: tuple[Signal, ...] = ()    # the signals this finding was derived from
     detected_at: datetime = field(default_factory=_utcnow)
     finding_id: str = field(default_factory=_new_id)
@@ -136,8 +137,12 @@ class Finding:
         return self.severity.rank >= Severity.WARNING.rank
 
     def horizon_human(self) -> str:
+        """None: no time bound. 0: already crossed (a present condition, not
+        "impact in zero minutes"). Positive: a countdown to impact."""
         if self.horizon_seconds is None:
             return "no time bound"
+        if self.horizon_seconds == 0:
+            return "already crossed"
         s = self.horizon_seconds
         if s < 3600:
             return f"~{s // 60} min"

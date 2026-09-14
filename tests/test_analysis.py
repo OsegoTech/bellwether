@@ -519,6 +519,8 @@ def test_designed_prompt_carries_every_part_of_the_finding(oplog_finding: Findin
     prompt = render_prompt(oplog_finding, context)
 
     assert "A detector fired on replica set rs0." in prompt
+    # 40 min against a 60 min resync is CRITICAL: the threshold is already crossed.
+    assert "time to impact: already crossed" in prompt
     for part in (
         oplog_finding.failure_mode,
         oplog_finding.severity.value,
