@@ -38,11 +38,30 @@ SECRETS = {
     SLACK_SIGNING: "slack-signing-test-0000",
 }
 
-VOTING_NODES = [
+# Nearest voter to the West-Europe monitoring host first.
+FALLBACK_ORDER = [
+    "node-westeurope.mongo.internal:27017",
     "node-uae.mongo.internal:27017",
     "node-southafrica.mongo.internal:27017",
-    "node-westeurope.mongo.internal:27017",
 ]
+
+READ_URI = (
+    "mongodb://node-backup.mongo.internal:27017/"
+    "?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true"
+)
+
+
+def executor_block(**overrides: Any) -> dict[str, Any]:
+    block: dict[str, Any] = {
+        "enabled": True,
+        "mongo_uri": "mongodb://node-westeurope.mongo.internal:27017/"
+        "?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true",
+        "tls_cert_file": "/etc/bellwether/tls/meetadev-ai-exec.combined.pem",
+        "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
+        "allowed_actions": ["kill_op"],
+    }
+    block.update(overrides)
+    return block
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +82,7 @@ def minimal() -> dict[str, Any]:
     """Smallest valid config: claude only, no fallback, stdout only."""
     return {
         "mongo": {
-            "uri": "mongodb://node-backup.mongo.internal:27017/?authMechanism=MONGODB-X509",
+            "uri": READ_URI,
             "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
             "tls_cert_file": "/etc/bellwether/tls/meetadev-ai.combined.pem",
             "target_node": "node-backup.mongo.internal:27017",
@@ -92,7 +111,7 @@ def test_loads_example_yaml(secrets_env: None) -> None:
 
     assert isinstance(cfg, BellwetherConfig)
     assert cfg.mongo.target_node == "node-backup.mongo.internal:27017"
-    assert cfg.mongo.fallback_nodes == VOTING_NODES
+    assert cfg.mongo.fallback_nodes == FALLBACK_ORDER
     assert cfg.mongo.tls_ca_file == Path("/etc/mongodb/tls/ca-chain.cert.pem")
     assert "MONGODB-X509" in cfg.mongo.uri
     assert cfg.prometheus.enabled is True
@@ -104,6 +123,9 @@ def test_loads_example_yaml(secrets_env: None) -> None:
     assert isinstance(cfg.store.sqlite_path, Path)
     assert cfg.executor.enabled is False
     assert set(cfg.executor.allowed_actions) <= {"kill_op", "create_small_index"}
+    assert cfg.executor.document_threshold == 100_000
+    # Separate write identity, with its own cert.
+    assert cfg.executor.tls_cert_file != cfg.mongo.tls_cert_file
 
 
 def test_example_secrets_come_from_env(secrets_env: None) -> None:
@@ -220,12 +242,15 @@ def test_optional_cert_passphrase_from_env(
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     path = write_yaml(tmp_path, minimal())
 
-    assert load_config(path).mongo.tls_cert_key_password is None
+    assert load_config(path).mongo.tls_cert_passphrase is None
 
-    monkeypatch.setenv("BELLWETHER_MONGO__TLS_CERT_KEY_PASSWORD", "hunter2")
-    password = load_config(path).mongo.tls_cert_key_password
-    assert password is not None
-    assert password.get_secret_value() == "hunter2"
+    monkeypatch.setenv("BELLWETHER_MONGO__TLS_CERT_PASSPHRASE", "hunter2")
+    monkeypatch.setenv("BELLWETHER_EXECUTOR__TLS_CERT_PASSPHRASE", "hunter3")
+    cfg = load_config(path)
+    assert cfg.mongo.tls_cert_passphrase is not None
+    assert cfg.mongo.tls_cert_passphrase.get_secret_value() == "hunter2"
+    assert cfg.executor.tls_cert_passphrase is not None
+    assert cfg.executor.tls_cert_passphrase.get_secret_value() == "hunter3"
 
 
 # --- Secrets are env-only, never YAML, never logged -------------------------
@@ -238,7 +263,8 @@ def test_optional_cert_passphrase_from_env(
         ("analysis", "openai_api_key", OPENAI_KEY),
         ("notify", "slack_webhook_url", SLACK_WEBHOOK),
         ("notify", "slack_signing_secret", SLACK_SIGNING),
-        ("mongo", "tls_cert_key_password", "BELLWETHER_MONGO__TLS_CERT_KEY_PASSWORD"),
+        ("mongo", "tls_cert_passphrase", "BELLWETHER_MONGO__TLS_CERT_PASSPHRASE"),
+        ("executor", "tls_cert_passphrase", "BELLWETHER_EXECUTOR__TLS_CERT_PASSPHRASE"),
     ],
 )
 def test_secret_in_yaml_is_rejected(
@@ -250,7 +276,7 @@ def test_secret_in_yaml_is_rejected(
 ) -> None:
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     data = minimal()
-    data[section][field] = "leaked-into-yaml-9f3a"
+    data.setdefault(section, {})[field] = "leaked-into-yaml-9f3a"
 
     with pytest.raises(ConfigError) as excinfo:
         load_config(write_yaml(tmp_path, data))
@@ -277,25 +303,117 @@ def test_executor_whitelist_cannot_be_widened(
 ) -> None:
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     data = minimal()
-    data["executor"] = {
-        "enabled": True,
-        "mongo_uri": "mongodb://node-uae.mongo.internal:27017/",
-        "allowed_actions": ["kill_op", "drop_database"],
-    }
+    data["executor"] = executor_block(allowed_actions=["kill_op", "drop_database"])
 
     with pytest.raises(ConfigError, match="drop_database"):
         load_config(write_yaml(tmp_path, data))
 
 
-def test_enabled_executor_requires_mongo_uri(
+def test_enabled_executor_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["executor"] = executor_block(document_threshold=5000)
+
+    cfg = load_config(write_yaml(tmp_path, data))
+
+    assert cfg.executor.enabled is True
+    assert cfg.executor.tls_ca_file == Path("/etc/mongodb/tls/ca-chain.cert.pem")
+    assert cfg.executor.document_threshold == 5000
+
+
+@pytest.mark.parametrize("missing", ["mongo_uri", "tls_cert_file", "tls_ca_file"])
+def test_enabled_executor_requires_connection_fields(
+    missing: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["executor"] = executor_block()
+    del data["executor"][missing]
+
+    with pytest.raises(ConfigError, match=f"executor.{missing}"):
+        load_config(write_yaml(tmp_path, data))
+
+
+def test_executor_must_not_reuse_read_identity_cert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     data = minimal()
-    data["executor"] = {"enabled": True, "allowed_actions": ["kill_op"]}
+    data["executor"] = executor_block(tls_cert_file=data["mongo"]["tls_cert_file"])
 
-    with pytest.raises(ConfigError, match="executor.mongo_uri"):
+    with pytest.raises(ConfigError, match="meetadev-ai-exec"):
         load_config(write_yaml(tmp_path, data))
+
+
+def test_document_threshold_must_be_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["executor"] = executor_block(document_threshold=0)
+
+    with pytest.raises(ConfigError, match="document_threshold"):
+        load_config(write_yaml(tmp_path, data))
+
+
+# --- Decision 6: certificates never ride in a mongo URI ---------------------
+
+FORBIDDEN_URI_PARAMS = [
+    "tlsCertificateKeyFile=/etc/bellwether/tls/x.pem",
+    "tlsCAFile=/etc/mongodb/tls/ca-chain.cert.pem",
+    "tlsCertificateKeyFilePassword=hunter2",
+    "tlscertificatekeyfile=/lowercase/still/caught.pem",
+    "ssl_certfile=/legacy/alias.pem",
+]
+
+
+@pytest.mark.parametrize("param", FORBIDDEN_URI_PARAMS)
+@pytest.mark.parametrize("section", ["mongo", "executor"])
+def test_cert_params_in_uri_are_rejected(
+    section: str, param: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["executor"] = executor_block()
+    key = "uri" if section == "mongo" else "mongo_uri"
+    data[section][key] += "&" + param
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(write_yaml(tmp_path, data))
+
+    message = str(excinfo.value)
+    assert f"{section}.{key}" in message
+    assert "tls_cert_file" in message
+    assert "hunter2" not in message
+
+
+def test_password_in_uri_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["mongo"]["uri"] = "mongodb://someone:s3cret-pw@node-backup.mongo.internal:27017/"
+
+    with pytest.raises(ConfigError, match="mongo.uri") as excinfo:
+        load_config(write_yaml(tmp_path, data))
+
+    assert "s3cret-pw" not in str(excinfo.value)
+
+
+def test_srv_uri_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Direct per-node connections need a plain mongodb:// URI."""
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["mongo"]["uri"] = "mongodb+srv://cluster.mongo.internal/"
+
+    with pytest.raises(ConfigError, match="mongo.uri"):
+        load_config(write_yaml(tmp_path, data))
+
+
+def test_example_uris_carry_no_cert_paths(secrets_env: None) -> None:
+    cfg = load_config(EXAMPLE_YAML)
+
+    for uri in (cfg.mongo.uri, cfg.executor.mongo_uri or ""):
+        assert "tlsCertificateKeyFile" not in uri
+        assert "tlsCAFile" not in uri
 
 
 def test_primary_and_fallback_must_differ(

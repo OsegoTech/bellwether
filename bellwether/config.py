@@ -17,6 +17,11 @@ not an hour later when the first finding tries to reach a provider.
 
 The executor whitelist is fixed here as a ``Literal``: config can narrow the
 allowed actions, never widen them.
+
+Certificates never ride in a mongo URI. The read and write URIs carry host and
+auth options only; cert, CA, and passphrase are separate typed fields handed to
+``MongoClient`` as keyword arguments. A URI carrying a cert option or a
+password is a load-time error.
 """
 
 from __future__ import annotations
@@ -26,9 +31,18 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal, get_args
+from urllib.parse import parse_qsl, urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from bellwether.models import Severity
@@ -69,15 +83,70 @@ class _Section(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+# URI options that would put a cert, CA, or key passphrase in the URI string —
+# current pymongo names plus legacy aliases. Compared lowercased.
+_FORBIDDEN_URI_OPTIONS = frozenset(
+    {
+        "tlscertificatekeyfile",
+        "tlscertificatekeyfilepassword",
+        "tlscafile",
+        "ssl_certfile",
+        "ssl_keyfile",
+        "ssl_ca_certs",
+        "ssl_pem_passphrase",
+        "sslpemkeyfile",
+        "sslpemkeypassword",
+        "sslcafile",
+    }
+)
+
+
+def _check_mongo_uri(uri: str, section: str, field: str) -> str:
+    """Reject URIs carrying certs or passwords. Messages never echo values."""
+    where = f"{section}.{field}"
+    parts = urlsplit(uri)
+    if parts.scheme != "mongodb":
+        raise ValueError(
+            f"{where} must use the mongodb:// scheme "
+            "(Bellwether connects to named nodes directly; mongodb+srv is not supported)"
+        )
+    userinfo = parts.netloc.rpartition("@")[0]
+    if ":" in userinfo:
+        raise ValueError(f"{where} must not embed a password; X.509 auth needs none")
+    forbidden = sorted(
+        {
+            name
+            for name, _ in parse_qsl(parts.query, keep_blank_values=True)
+            if name.lower() in _FORBIDDEN_URI_OPTIONS
+        }
+    )
+    if forbidden:
+        raise ValueError(
+            f"{where} must not carry certificate options ({', '.join(forbidden)}); "
+            f"set {section}.tls_cert_file and {section}.tls_ca_file instead, "
+            f"and the passphrase via {env_var_for(section, 'tls_cert_passphrase')}"
+        )
+    return uri
+
+
 class MongoConfig(_Section):
-    """The read side. Identity ``meetadev-ai``; no write path exists here."""
+    """The read side. Identity ``meetadev-ai``; no write path exists here.
+
+    ``uri`` supplies auth options (X.509, $external, tls). The host in it is
+    replaced per connection attempt by ``target_node`` then ``fallback_nodes``.
+    """
 
     uri: str
     tls_ca_file: Path
     tls_cert_file: Path
     target_node: str
     fallback_nodes: list[str] = Field(default_factory=list)
-    tls_cert_key_password: SecretStr | None = None
+    tls_cert_passphrase: SecretStr | None = None
+
+    @field_validator("uri")
+    @classmethod
+    def _uri_carries_no_credentials(cls, value: str) -> str:
+        return _check_mongo_uri(value, "mongo", "uri")
 
 
 class PrometheusConfig(_Section):
@@ -138,12 +207,32 @@ class ExecutorConfig(_Section):
 
     enabled: bool = False
     mongo_uri: str | None = None
+    tls_cert_file: Path | None = None
+    tls_ca_file: Path | None = None
+    tls_cert_passphrase: SecretStr | None = None
     allowed_actions: list[ExecutorAction] = Field(default_factory=list)
+    document_threshold: int = Field(default=100_000, gt=0)  # create_small_index ceiling
+
+    @field_validator("mongo_uri")
+    @classmethod
+    def _uri_carries_no_credentials(cls, value: str | None) -> str | None:
+        return None if value is None else _check_mongo_uri(value, "executor", "mongo_uri")
 
     @model_validator(mode="after")
-    def _uri_when_enabled(self) -> ExecutorConfig:
-        if self.enabled and not self.mongo_uri:
-            raise ValueError("executor.mongo_uri is required when executor.enabled is true")
+    def _connection_when_enabled(self) -> ExecutorConfig:
+        if self.enabled:
+            missing = [
+                name
+                for name in ("mongo_uri", "tls_cert_file", "tls_ca_file")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "; ".join(
+                        f"executor.{name} is required when executor.enabled is true"
+                        for name in missing
+                    )
+                )
         return self
 
 
@@ -186,6 +275,17 @@ class BellwetherConfig(BaseSettings):
         if "slack" in self.notify.channels:
             needed += [("notify", "slack_webhook_url"), ("notify", "slack_signing_secret")]
         return needed
+
+    @model_validator(mode="after")
+    def _separate_write_identity(self) -> BellwetherConfig:
+        if self.executor.tls_cert_file is not None and (
+            self.executor.tls_cert_file == self.mongo.tls_cert_file
+        ):
+            raise ValueError(
+                "executor.tls_cert_file must be the write identity's own cert "
+                "(meetadev-ai-exec), not the read identity's mongo.tls_cert_file"
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_secrets(self) -> BellwetherConfig:
