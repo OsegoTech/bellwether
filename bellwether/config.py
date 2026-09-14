@@ -168,7 +168,9 @@ class AnalysisConfig(_Section):
     claude_model: str | None = None
     openai_model: str | None = None
     max_retries: int = Field(default=1, ge=0)  # retries after the first attempt, per provider
-    timeout_seconds: float = Field(default=60.0, gt=0)
+    # Per provider call. Opus 5 thinks adaptively by default; 120 s leaves room
+    # for a full answer before the chain gives up and fails over.
+    timeout_seconds: float = Field(default=120.0, gt=0)
     escalate_min_severity: Severity = Severity.WARNING
     anthropic_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None

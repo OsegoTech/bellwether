@@ -451,6 +451,24 @@ def test_executor_uri_must_name_the_replica_set(
         load_config(write_yaml(tmp_path, data))
 
 
+# --- Correction C: analysis timeout ---------------------------------------------------
+
+
+def test_analysis_timeout_defaults_to_120_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+
+    assert load_config(write_yaml(tmp_path, minimal())).analysis.timeout_seconds == 120
+
+
+def test_example_analysis_timeout_is_120_seconds(secrets_env: None) -> None:
+    assert load_config(EXAMPLE_YAML).analysis.timeout_seconds == 120
+
+
+# --- Correction B: approver allowlist -------------------------------------------------
+
+
 def test_approver_ids_default_to_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
 
