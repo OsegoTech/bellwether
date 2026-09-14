@@ -85,6 +85,16 @@ detectors:
     maintenance_window_seconds: 3600
     # WARNING while the window is under resync x safety_factor; CRITICAL under resync.
     safety_factor: 2.0
+  index_advisor:
+    # A query shape needs an index above this many docs examined per doc
+    # returned AND at least this many bytes read for nothing (50 MiB).
+    targeting_ratio_threshold: 100
+    wasted_bytes_floor: 52428800
+    # CRITICAL when both are exceeded (10,000 per doc returned; 1 GiB).
+    critical_targeting_ratio: 10000
+    critical_wasted_bytes: 1073741824
+    max_suggestions: 20                  # Performance Advisor shows at most 20 shapes
+    min_unused_index_age_seconds: 604800 # 7 days of $indexStats before "unused"
 
 executor:
   # Write identity meetadev-ai-exec — distinct from the read identity above,

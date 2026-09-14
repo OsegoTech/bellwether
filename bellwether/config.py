@@ -317,8 +317,24 @@ class OplogWindowDetectorConfig(_Section):
     safety_factor: float = Field(default=2.0, ge=1.0)
 
 
+class IndexAdvisorDetectorConfig(_Section):
+    # A shape is a missing-index candidate above this many docs examined per doc
+    # returned AND at least this many bytes read for nothing.
+    targeting_ratio_threshold: float = Field(default=100.0, ge=1.0)
+    wasted_bytes_floor: int = Field(default=50 * 2**20, ge=0)
+    # CRITICAL when both of these are exceeded; WARNING otherwise.
+    critical_targeting_ratio: float = Field(default=10_000.0, ge=1.0)
+    critical_wasted_bytes: int = Field(default=2**30, ge=0)
+    # Performance Advisor shows at most 20 query shapes.
+    max_suggestions: int = Field(default=20, ge=1)
+    # $indexStats counters reset on restart: an index is only called unused once
+    # its counters have run this long.
+    min_unused_index_age_seconds: int = Field(default=7 * 86_400, ge=0)
+
+
 class DetectorsConfig(_Section):
     oplog_window: OplogWindowDetectorConfig = Field(default_factory=OplogWindowDetectorConfig)
+    index_advisor: IndexAdvisorDetectorConfig = Field(default_factory=IndexAdvisorDetectorConfig)
 
 
 class BellwetherConfig(BaseSettings):

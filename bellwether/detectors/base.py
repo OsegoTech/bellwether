@@ -32,3 +32,13 @@ class Detector(ABC):
 
     @abstractmethod
     def evaluate(self, signals: Sequence[Signal]) -> Finding | None: ...
+
+    def evaluate_all(self, signals: Sequence[Signal]) -> list[Finding]:
+        """Every finding from these signals. The pipeline calls this.
+
+        A detector for one condition (the oplog window) finds at most one; one
+        that can fire many times per pass (an index per query shape) overrides
+        this.
+        """
+        finding = self.evaluate(signals)
+        return [] if finding is None else [finding]
