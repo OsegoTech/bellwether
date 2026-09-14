@@ -7,13 +7,19 @@ with — so tests can assert on connection order and on how TLS was configured.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
 
+import yaml
+from bson import Timestamp
 from pymongo.errors import OperationFailure, ServerSelectionTimeoutError
 
+from bellwether.analysis.provider import Provider
+from bellwether.models import Finding
 from bellwether.mongo import ClientFactory
 
 Doc = dict[str, Any]
@@ -161,6 +167,87 @@ class FakeCollection:
 
     def aggregate(self, pipeline: list[Doc]) -> list[Doc]:
         return _aggregate(self.database.client, self.database.name, self.name, pipeline)
+
+
+def oplog_cluster(window_seconds: int) -> FakeCluster:
+    """A cluster whose oplog holds `window_seconds` of history (read from a primary,
+    so the collector uses the mean write rate and needs no sampling)."""
+    cluster = FakeCluster()
+    start = 1_757_000_000
+    cluster.collections["local.oplog.rs"] = [
+        {"ts": Timestamp(start, 1)},
+        {"ts": Timestamp(start + window_seconds, 1)},
+    ]
+    cluster.aggregations["$collStats"] = lambda node, ns, pipeline: [
+        {"storageStats": {"maxSize": 990 * 2**20, "size": 512 * 2**20}}
+    ]
+    cluster.reply("serverStatus", {"repl": {"setName": "rs0", "secondary": False}, "ok": 1.0})
+    return cluster
+
+
+PROPOSAL_PAYLOAD: Doc = {
+    "diagnosis": "The oplog holds 40 minutes of history against a 60 minute resync estimate.",
+    "mechanism": "local.oplog.rs is capped by size; the write rate truncates older entries.",
+    "impact_if_ignored": "A secondary down for maintenance past the window needs an initial sync.",
+    "action": {
+        "kind": "propose_only",
+        "title": "Grow the oplog on every member",
+        "command": "db.adminCommand({ replSetResizeOplog: 1, size: 51200 })",
+        "rationale": "A larger oplog restores a window above the resync estimate.",
+        "reversible": True,
+        "executor_op": None,
+        "executor_args": None,
+    },
+    "confidence": 0.8,
+}
+
+
+class StaticProvider(Provider):
+    """Answers every call with the same payload (or raises the same error)."""
+
+    def __init__(self, name: str, reply: Doc | Exception) -> None:
+        self.name = name
+        self.reply = reply
+        self.calls = 0
+
+    def analyze(self, finding: Finding, context: dict[str, Any]) -> Doc:
+        self.calls += 1
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return copy.deepcopy(self.reply)
+
+
+PROVIDER_KEYS = {
+    "BELLWETHER_ANALYSIS__ANTHROPIC_API_KEY": "sk-ant-test-0000",
+    "BELLWETHER_ANALYSIS__OPENAI_API_KEY": "sk-openai-test-0000",
+}
+
+
+def write_config(directory: Path, **sections: Doc) -> Path:
+    """A config YAML for rs0 with the store under `directory`; sections merge in."""
+    data: Doc = {
+        "mongo": {
+            "uri": READ_URI,
+            "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
+            "tls_cert_file": "/etc/bellwether/tls/meetadev-ai.combined.pem",
+            "target_node": TARGET,
+            "fallback_nodes": FALLBACKS,
+        },
+        "analysis": {
+            "primary_provider": "claude",
+            "fallback_provider": "openai",
+            "claude_model": "claude-opus-5",
+            "openai_model": "gpt-5",
+        },
+        "notify": {"channels": ["stdout"]},
+        "store": {"sqlite_path": str(directory / "bellwether.db")},
+        "collectors": {"oplog_window": {"sample_interval_seconds": 0}},
+    }
+    for name, values in sections.items():
+        data.setdefault(name, {}).update(values)
+    path = directory / "bellwether.yaml"
+    path.write_text(yaml.safe_dump(data))
+    return path
 
 
 def _aggregate(client: FakeClient, db: str, collection: str, pipeline: list[Doc]) -> list[Doc]:
