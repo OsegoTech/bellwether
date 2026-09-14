@@ -16,7 +16,11 @@ The sweep, read-only, each member over its own pinned client (closed after):
 1. Per application database: the profiler level (``{profile: -1}``) and,
    unless profiling is off, the newest ``system.profile`` entries for find /
    aggregate / getMore at or over ``slow_ms``, kept if their plan is a
-   COLLSCAN or they examine many documents per document returned.
+   COLLSCAN or they examine many documents per document returned. Reading
+   the level needs ``enableProfiler``, which only ``dbAdmin`` grants — with
+   createIndex, dropIndex and dropDatabase — so the read identity is refused
+   it by design: the level is then recorded as unknown, the profiler is read
+   anyway, and profiler_disabled does not fire. An accepted blind spot.
 2. For every collection with slow queries on *any* member: each member's
    ``$indexStats`` and ``$collStats`` — index use must be known everywhere,
    not only where the slow queries ran.
@@ -159,6 +163,14 @@ class QueryProfileCollector(Collector):
 
     @staticmethod
     def _profiling_level(reader: ReadOnlyMongo, db: str) -> Level:
+        # Deliberate, accepted blind spot. {profile: -1} needs the enableProfiler
+        # action, and MongoDB grants that only through dbAdmin — bundled with
+        # createIndex, dropIndex and dropDatabase. meetadev-ai is a read identity
+        # and will not be given dbAdmin to learn a profiler level. So the level is
+        # often refused: it is recorded as unknown, system.profile is read anyway
+        # (reading it is covered by read@<db>, as $collStats is; $indexStats by
+        # clusterMonitor), and profiler_disabled simply does not fire. No role
+        # change, no new privilege.
         try:
             return reader.profiling_status(db).level, None
         except OperationFailure as exc:

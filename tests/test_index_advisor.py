@@ -402,6 +402,15 @@ def test_unknown_profiler_level_still_analyses_the_ops() -> None:
     assert of_mode(run(profile_signal(level=None)), MISSING_INDEX_COLLSCAN)
 
 
+def test_an_unknown_profiler_level_never_fires_profiler_disabled() -> None:
+    # The accepted blind spot: {profile: -1} needs enableProfiler (dbAdmin only),
+    # which the read identity does not hold. Unknown is not "off".
+    findings = run(profile_signal(level=None), profile_signal(level=None, node="node-uae.mongo.internal:27017"))
+
+    assert of_mode(findings, PROFILER_DISABLED) == []
+    assert of_mode(findings, MISSING_INDEX_COLLSCAN)
+
+
 # --- Members: signals from every node are merged per collection ----------------------------
 
 PRIMARY = "node-uae.mongo.internal:27017"

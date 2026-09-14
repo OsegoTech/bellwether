@@ -225,6 +225,12 @@ class ReadOnlyMongo:
         Sends ``{profile: -1}``, which only reads the level. The forms that set
         it (0, 1, 2) are unreachable from here, which is also why ``profile`` is
         not in run_admin_command's allowlist.
+
+        Even reading the level needs the ``enableProfiler`` action, which
+        MongoDB grants only through ``dbAdmin`` — together with createIndex,
+        dropIndex and dropDatabase. The read identity deliberately does not
+        hold it, so on an enforcing cluster this raises OperationFailure
+        (Unauthorized) and callers treat the level as unknown.
         """
         reply = self._read(
             "profiling_status", lambda c: c[db].command({"profile": -1}), db=db
