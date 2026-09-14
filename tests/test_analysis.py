@@ -24,7 +24,16 @@ import openai
 import pytest
 
 from bellwether.analysis import analyst as analyst_module
-from bellwether.analysis.analyst import KNOWN_REMEDIATIONS, PROMPT_TEMPLATE, Analyst, render_prompt
+from bellwether.analysis.analyst import (
+    DEFAULT_REPLICA_SET,
+    KNOWN_MECHANISMS,
+    KNOWN_REMEDIATIONS,
+    PROMPT_TEMPLATE,
+    SYSTEM_PROMPT,
+    Analyst,
+    render_prompt,
+    replica_set_name,
+)
 from bellwether.analysis.claude import ClaudeProvider
 from bellwether.analysis.openai import OpenAIProvider
 from bellwether.analysis.provider import (
@@ -36,6 +45,8 @@ from bellwether.analysis.provider import (
     parse_json_object,
 )
 from bellwether.analysis.schema import PROPOSAL_SCHEMA, ProposalPayload, validate_payload, wire_schema
+from bellwether.config import MongoConfig
+from bellwether.detectors.oplog_window import OplogWindowDetector
 from bellwether.models import (
     ActionKind,
     Evidence,
@@ -441,7 +452,7 @@ def test_context_is_bounded(finding: Finding) -> None:
     analyst, claude, _ = analyst_with([VALID], [VALID])
     analyst.analyze(finding)
 
-    assert set(claude.contexts[0]) == {"topology", "remediations"}
+    assert set(claude.contexts[0]) == {"topology", "remediations", "mechanism", "replica_set"}
 
 
 def test_unknown_failure_mode_still_renders(finding: Finding) -> None:
@@ -459,11 +470,129 @@ def test_unknown_failure_mode_still_renders(finding: Finding) -> None:
     assert "Something new." in prompt
 
 
-def test_prompt_template_is_marked_for_design_review() -> None:
+def test_prompt_is_the_designed_version_not_the_stub() -> None:
     source = Path(analyst_module.__file__).read_text()
 
-    assert "# TODO(design): prompt wording set in design review" in source
-    assert isinstance(PROMPT_TEMPLATE, str) and PROMPT_TEMPLATE.strip()
+    assert "TODO(design)" not in source
+    assert PROMPT_TEMPLATE.startswith("A detector fired on replica set {replica_set}.")
+
+
+# --- The designed prompt: evidence-constrained, mechanism-grounded -----------------
+
+TOPOLOGY = (
+    "Diagnostic reads are served by node-backup.mongo.internal:27017; fallback order: "
+    "node-westeurope.mongo.internal:27017, node-uae.mongo.internal:27017, "
+    "node-southafrica.mongo.internal:27017."
+)
+
+
+@pytest.fixture
+def oplog_finding() -> Finding:
+    """A real Finding, produced by the oplog-window detector from a 40-minute window."""
+    size, window = 990 * 2**20, 2400
+    signal = Signal(
+        signal_class=SignalClass.REPLICATION,
+        source="oplog_window",
+        node=TARGET,
+        evidence=(
+            Evidence("oplog_size_bytes", size, "bytes"),
+            Evidence("oplog_used_bytes", size, "bytes"),
+            Evidence("oplog_window_seconds", window, "s"),
+            Evidence("oplog_mean_rate_bytes_per_sec", size / window, "bytes/s"),
+            Evidence("write_rate_bytes_per_sec", size / window, "bytes/s"),
+            Evidence("write_rate_source", "oplog_mean"),
+        ),
+    )
+    finding = OplogWindowDetector().evaluate([signal])
+    assert finding is not None
+    return finding
+
+
+def designed_analyst() -> Analyst:
+    chain = ProviderChain([ScriptedProvider("claude", [VALID])])
+    return Analyst(chain, topology=TOPOLOGY, replica_set="rs0")
+
+
+def test_designed_prompt_carries_every_part_of_the_finding(oplog_finding: Finding) -> None:
+    context = designed_analyst().build_context(oplog_finding)
+
+    prompt = render_prompt(oplog_finding, context)
+
+    assert "A detector fired on replica set rs0." in prompt
+    for part in (
+        oplog_finding.failure_mode,
+        oplog_finding.severity.value,
+        oplog_finding.node,
+        oplog_finding.horizon_human(),
+        oplog_finding.summary,
+        TOPOLOGY,
+    ):
+        assert part in prompt, part
+    for evidence in oplog_finding.evidence:
+        assert evidence.render() in prompt, evidence.name
+    assert KNOWN_MECHANISMS["oplog_window_below_resync"] in prompt
+    for hint in KNOWN_REMEDIATIONS["oplog_window_below_resync"]:
+        assert hint in prompt
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"topology": "", "remediations": []},
+        {"topology": "", "remediations": [], "mechanism": "", "replica_set": "rs0"},
+    ],
+    ids=["keys absent", "keys empty"],
+)
+def test_missing_mechanism_renders_an_explicit_line(context: dict[str, Any]) -> None:
+    other = Finding(
+        signal_class=SignalClass.CAPACITY,
+        failure_mode="not_a_known_failure_mode",
+        severity=Severity.WARNING,
+        node=TARGET,
+        summary="Something new.",
+        evidence=(Evidence("cache_dirty_ratio", 0.21),),
+    )
+
+    prompt = render_prompt(other, context)
+
+    assert "(no mechanism on file for this failure mode)" in prompt
+    assert "(none on file for this failure mode)" in prompt
+    assert "  mechanism:\n\n" not in prompt  # never an empty block
+
+
+def test_system_prompt_carries_the_load_bearing_instructions() -> None:
+    assert "the numbers in the evidence are ground truth" in SYSTEM_PROMPT
+    assert "You propose; you never act" in SYSTEM_PROMPT
+    assert "lower your confidence" in SYSTEM_PROMPT
+
+
+def test_build_context_adds_mechanism_and_replica_set(oplog_finding: Finding) -> None:
+    context = designed_analyst().build_context(oplog_finding)
+
+    assert context["mechanism"] == KNOWN_MECHANISMS["oplog_window_below_resync"]
+    assert context["mechanism"].strip()
+    assert context["replica_set"] == "rs0"
+
+
+def test_every_remediation_mode_has_a_mechanism() -> None:
+    assert set(KNOWN_REMEDIATIONS) <= set(KNOWN_MECHANISMS)
+
+
+def _mongo_config(uri: str) -> MongoConfig:
+    return MongoConfig(
+        uri=uri,
+        tls_ca_file=Path("/etc/mongodb/tls/ca-chain.cert.pem"),
+        tls_cert_file=Path("/etc/bellwether/tls/meetadev-ai.combined.pem"),
+        target_node=TARGET,
+    )
+
+
+def test_replica_set_name_comes_from_the_uri_else_the_documented_default() -> None:
+    named = "mongodb://node-backup.mongo.internal:27017/?replicaSet=ledger0&tls=true"
+    unnamed = "mongodb://node-backup.mongo.internal:27017/?tls=true&directConnection=true"
+
+    assert replica_set_name(_mongo_config(named)) == "ledger0"
+    assert replica_set_name(_mongo_config(unnamed)) == DEFAULT_REPLICA_SET == "rs0"
 
 
 # --- Claude and OpenAI wrappers (SDK clients faked, no network) -------------

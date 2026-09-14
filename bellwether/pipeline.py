@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 
 from pydantic import SecretStr
 
-from bellwether.analysis.analyst import Analyst, topology_summary
+from bellwether.analysis.analyst import Analyst, replica_set_name, topology_summary
 from bellwether.analysis.claude import ClaudeProvider
 from bellwether.analysis.openai import OpenAIProvider
 from bellwether.analysis.provider import AnalysisUnavailable, Provider, ProviderChain
@@ -98,7 +98,11 @@ def build_providers(config: BellwetherConfig) -> list[Provider]:
 
 def build_analyst(config: BellwetherConfig) -> Analyst:
     chain = ProviderChain(build_providers(config), max_retries=config.analysis.max_retries)
-    return Analyst(chain, topology=topology_summary(config.mongo))
+    return Analyst(
+        chain,
+        topology=topology_summary(config.mongo),
+        replica_set=replica_set_name(config.mongo),
+    )
 
 
 def build_store(config: BellwetherConfig) -> SqliteStore:

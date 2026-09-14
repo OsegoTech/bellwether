@@ -19,7 +19,14 @@ from bellwether.analysis.claude import ClaudeProvider
 from bellwether.analysis.openai import OpenAIProvider
 from bellwether.analysis.provider import Provider, ProviderChain, ProviderError
 from bellwether.config import BellwetherConfig, load_config
-from bellwether.models import ApprovalRecord, ApprovalState, Proposal, Severity
+from bellwether.models import (
+    ApprovalRecord,
+    ApprovalState,
+    Finding,
+    Proposal,
+    Severity,
+    SignalClass,
+)
 from bellwether.mongo import ReadOnlyMongo
 from bellwether.notify.base import Notifier
 from bellwether.notify.slack import SlackNotifier
@@ -271,6 +278,23 @@ def test_build_providers_follows_config(tmp_path: Path) -> None:
     providers = pipeline.build_providers(config_in(tmp_path))
 
     assert [type(p) for p in providers] == [ClaudeProvider, OpenAIProvider]
+
+
+def test_build_analyst_grounds_the_prompt_in_config(tmp_path: Path) -> None:
+    finding = Finding(
+        signal_class=SignalClass.REPLICATION,
+        failure_mode="oplog_window_below_resync",
+        severity=Severity.CRITICAL,
+        node=TARGET,
+        summary="Oplog window is 40 min.",
+        evidence=(),
+    )
+
+    context = pipeline.build_analyst(config_in(tmp_path)).build_context(finding)
+
+    assert context["replica_set"] == "rs0"  # read URI names no set: documented default
+    assert TARGET in context["topology"]
+    assert context["mechanism"]
 
 
 def test_build_providers_single_provider(tmp_path: Path) -> None:
