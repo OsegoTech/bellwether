@@ -451,6 +451,51 @@ def test_executor_uri_must_name_the_replica_set(
         load_config(write_yaml(tmp_path, data))
 
 
+# --- .env for local development -------------------------------------------------------
+
+
+def write_dotenv(directory: Path, values: dict[str, str]) -> None:
+    (directory / ".env").write_text("".join(f"{name}={value}\n" for name, value in values.items()))
+
+
+def test_dotenv_values_are_loaded(tmp_path: Path) -> None:
+    assert Path.cwd() == tmp_path  # tests/conftest.py: each test runs in its own directory
+    write_dotenv(
+        tmp_path,
+        {
+            "BELLWETHER_PROMETHEUS__BASE_URL": "http://from-dotenv:9090",
+            ANTHROPIC_KEY: "sk-ant-from-dotenv",
+        },
+    )
+    data = minimal()
+    data["prometheus"] = {"enabled": True, "base_url": "http://from-yaml:9090"}
+
+    cfg = load_config(write_yaml(tmp_path, data))
+
+    assert cfg.prometheus.base_url == "http://from-dotenv:9090"  # .env beats YAML
+    assert cfg.prometheus.enabled is True  # YAML sibling survives (deep merge)
+    key = cfg.analysis.anthropic_api_key
+    assert key is not None and key.get_secret_value() == "sk-ant-from-dotenv"
+
+
+def test_real_environment_beats_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_dotenv(
+        tmp_path,
+        {
+            "BELLWETHER_PROMETHEUS__BASE_URL": "http://from-dotenv:9090",
+            ANTHROPIC_KEY: "sk-ant-from-dotenv",
+        },
+    )
+    monkeypatch.setenv("BELLWETHER_PROMETHEUS__BASE_URL", "http://from-env:9090")
+    monkeypatch.setenv(ANTHROPIC_KEY, "sk-ant-from-env")
+
+    cfg = load_config(write_yaml(tmp_path, minimal()))
+
+    assert cfg.prometheus.base_url == "http://from-env:9090"
+    key = cfg.analysis.anthropic_api_key
+    assert key is not None and key.get_secret_value() == "sk-ant-from-env"
+
+
 # --- Correction C: analysis timeout ---------------------------------------------------
 
 

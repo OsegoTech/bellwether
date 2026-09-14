@@ -3,14 +3,16 @@ Typed configuration for Bellwether: YAML file, overridden by env.
 
 Precedence, lowest to highest:
 
-    YAML file  <  BELLWETHER_* environment variables
+    YAML file  <  .env (working directory)  <  BELLWETHER_* environment variables
 
 Env vars address nested keys with a double underscore:
 ``BELLWETHER_PROMETHEUS__BASE_URL`` overrides ``prometheus.base_url``. Overrides
-deep-merge, so setting one key leaves its YAML siblings in place.
+deep-merge, so setting one key leaves its YAML siblings in place. A ``.env``
+file in the working directory uses the same names, for local development; it
+is git-ignored, and a real environment variable always beats it.
 
-Secrets (API keys, Slack webhook and signing secret, cert passphrases) are env
-only. Every field typed ``SecretStr`` is a secret; finding one in the YAML is a
+Secrets (API keys, Slack webhook and signing secret, cert passphrases) come
+from the environment or ``.env`` only. Every field typed ``SecretStr`` is a secret; finding one in the YAML is a
 load-time error, as is a secret that an enabled feature needs but the env does
 not supply. Failing at load time means a misconfigured deploy dies at start,
 not an hour later when the first finding tries to reach a provider.
@@ -313,6 +315,8 @@ class BellwetherConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix=ENV_PREFIX,
         env_nested_delimiter=ENV_NESTED_DELIMITER,
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="forbid",
         frozen=True,
     )
@@ -336,9 +340,9 @@ class BellwetherConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Earlier sources win. Env beats init kwargs (the YAML layer); no .env
-        # files or secrets dirs — the process environment is the only secret source.
-        return (env_settings, init_settings)
+        # Earlier sources win: the real environment, then a local .env, then init
+        # kwargs (the YAML layer). No secrets dirs.
+        return (env_settings, dotenv_settings, init_settings)
 
     def required_secrets(self) -> list[tuple[str, str]]:
         """(section, field) of every secret the enabled features need."""
