@@ -218,6 +218,24 @@ def test_show_renders_the_proposal_and_audit_trail(
     assert "pending" in out
 
 
+def test_show_includes_refused_decision_attempts(
+    config_path: Path, store: SqliteStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    proposal = make_proposal()
+    store.record_proposal(proposal)
+    store.record_audit_event(
+        "unauthorized_decision",
+        proposal_id=proposal.proposal_id,
+        actor="slack:mallory (U0MALLORY)",
+        detail="approve refused: U0MALLORY is not in approval.approver_ids",
+    )
+
+    assert cli.main(["--config", str(config_path), "show", proposal.proposal_id]) == 0
+
+    out = capsys.readouterr().out
+    assert "unauthorized_decision" in out and "U0MALLORY" in out
+
+
 def test_show_unknown_proposal(config_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["--config", str(config_path), "show", "0" * 32]) == 1
     assert "no proposal" in capsys.readouterr().err
@@ -325,10 +343,20 @@ def test_serve_requires_the_signing_secret(
     assert "BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET" in capsys.readouterr().err
 
 
+def test_serve_requires_an_approver_allowlist(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET", "s3cret")
+
+    assert cli.main(["--config", str(config_path), "serve"]) == 2
+    assert "BELLWETHER_APPROVAL__APPROVER_IDS" in capsys.readouterr().err
+
+
 def test_serve_starts_uvicorn_on_localhost(
     config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET", "s3cret")
+    monkeypatch.setenv("BELLWETHER_APPROVAL__APPROVER_IDS", '["U0OSEGO"]')
     started: dict[str, Any] = {}
 
     def fake_run(app: FastAPI, **kwargs: Any) -> None:

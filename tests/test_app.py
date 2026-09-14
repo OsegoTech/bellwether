@@ -36,6 +36,8 @@ from bellwether.store.sqlite import SqliteStore
 
 SECRET = "8f742231b10e8888abcd99yyyzzz85a5"
 NOW = 1_757_851_200
+APPROVERS = frozenset({"U0OSEGO"})
+MALLORY = {"id": "U0MALLORY", "username": "mallory"}
 T0 = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
 
 
@@ -109,7 +111,9 @@ def executor(store: SqliteStore) -> FakeExecutor:
 
 @pytest.fixture
 def client(store: SqliteStore, executor: FakeExecutor) -> TestClient:
-    app = create_app(store, signing_secret=SECRET, executor=executor, clock=lambda: NOW)
+    app = create_app(
+        store, signing_secret=SECRET, approver_ids=APPROVERS, executor=executor, clock=lambda: NOW
+    )
     return TestClient(app)
 
 
@@ -153,6 +157,7 @@ def test_bad_signature_is_rejected_401(
     assert response.status_code == 401
     assert store.current_state(proposal.proposal_id).state is ApprovalState.PENDING
     assert executor.calls == []
+    assert store.list_audit_events() == []  # unverified requests carry no trustworthy identity
 
 
 @pytest.mark.parametrize(
@@ -278,7 +283,13 @@ def test_second_decision_is_refused(
 def test_executor_refusal_leaves_the_approval_standing(store: SqliteStore) -> None:
     refusing = FakeExecutor(store, error=ExecutionRefused("executor is disabled"))
     client = TestClient(
-        create_app(store, signing_secret=SECRET, executor=refusing, clock=lambda: NOW)
+        create_app(
+            store,
+            signing_secret=SECRET,
+            approver_ids=APPROVERS,
+            executor=refusing,
+            clock=lambda: NOW,
+        )
     )
     proposal = make_proposal()
     store.record_proposal(proposal)
@@ -294,7 +305,11 @@ def test_executor_refusal_leaves_the_approval_standing(store: SqliteStore) -> No
 def test_executable_approve_without_executor_is_recorded_for_manual_run(
     store: SqliteStore,
 ) -> None:
-    client = TestClient(create_app(store, signing_secret=SECRET, executor=None, clock=lambda: NOW))
+    client = TestClient(
+        create_app(
+            store, signing_secret=SECRET, approver_ids=APPROVERS, executor=None, clock=lambda: NOW
+        )
+    )
     proposal = make_proposal()
     store.record_proposal(proposal)
     body = slack_body(APPROVE_ACTION_ID, proposal.proposal_id)
@@ -326,6 +341,90 @@ def test_unknown_proposal_is_404(client: TestClient) -> None:
 )
 def test_malformed_payload_is_400(client: TestClient, body: bytes) -> None:
     assert post(client, body, signed(body)).status_code == 400
+
+
+# --- Correction B: approver allowlist ----------------------------------------------------
+
+
+@pytest.mark.parametrize(("action_id", "verb"), [(APPROVE_ACTION_ID, "approve"), (REJECT_ACTION_ID, "reject")])
+def test_non_allowlisted_user_is_refused_and_recorded(
+    client: TestClient,
+    store: SqliteStore,
+    executor: FakeExecutor,
+    action_id: str,
+    verb: str,
+) -> None:
+    proposal = make_proposal(ActionKind.EXECUTABLE)
+    store.record_proposal(proposal)
+    body = slack_body(action_id, proposal.proposal_id, user=MALLORY)
+
+    response = post(client, body, signed(body))
+
+    assert response.status_code == 403
+    assert "not an authorized approver" in response.json()["message"]
+    assert store.current_state(proposal.proposal_id).state is ApprovalState.PENDING
+    assert len(store.history(proposal.proposal_id)) == 1  # no transition row
+    assert executor.calls == []
+    [event] = store.list_audit_events(proposal.proposal_id)
+    assert event.kind == "unauthorized_decision"
+    assert event.actor is not None and "U0MALLORY" in event.actor
+    assert verb in event.detail
+
+
+def test_allowlisted_approver_proceeds(store: SqliteStore, executor: FakeExecutor) -> None:
+    client = TestClient(
+        create_app(
+            store,
+            signing_secret=SECRET,
+            approver_ids={"U0OSEGO", "U0TEAMMATE"},
+            executor=executor,
+            clock=lambda: NOW,
+        )
+    )
+    proposal = make_proposal(ActionKind.EXECUTABLE)
+    store.record_proposal(proposal)
+    body = slack_body(
+        APPROVE_ACTION_ID, proposal.proposal_id, user={"id": "U0TEAMMATE", "username": "teammate"}
+    )
+
+    response = post(client, body, signed(body))
+
+    assert response.status_code == 200
+    assert len(executor.calls) == 1
+    record = store.current_state(proposal.proposal_id)
+    assert record.state is ApprovalState.EXECUTED
+    assert record.decided_by is not None and "U0TEAMMATE" in record.decided_by
+    assert store.list_audit_events() == []
+
+
+def test_unauthorized_click_does_not_reveal_whether_a_proposal_exists(
+    client: TestClient, store: SqliteStore
+) -> None:
+    body = slack_body(APPROVE_ACTION_ID, "0" * 32, user=MALLORY)
+
+    response = post(client, body, signed(body))
+
+    assert response.status_code == 403
+    assert len(store.list_audit_events("0" * 32)) == 1
+
+
+def test_refused_attempt_appears_in_the_audit_trail(
+    client: TestClient, store: SqliteStore
+) -> None:
+    proposal = make_proposal()
+    store.record_proposal(proposal)
+    body = slack_body(APPROVE_ACTION_ID, proposal.proposal_id, user=MALLORY)
+    post(client, body, signed(body))
+
+    page = client.get(f"/proposals/{proposal.proposal_id}").text
+
+    assert "unauthorized_decision" in page
+    assert "U0MALLORY" in page
+
+
+def test_an_approver_allowlist_is_required(store: SqliteStore) -> None:
+    with pytest.raises(ValueError, match="approver"):
+        create_app(store, signing_secret=SECRET, approver_ids=set())
 
 
 # --- Read-only UI ---------------------------------------------------------------------

@@ -6,7 +6,12 @@ is a hole — using Slack's v0 scheme (HMAC-SHA256 over ``v0:<ts>:<raw body>``
 with the signing secret), a constant-time compare, and a five-minute replay
 window. Anything that fails is a 401 and changes nothing.
 
-A verified Approve records the APPROVED transition. If the proposal is
+A verified click is then checked against ``approval.approver_ids`` (Slack user
+IDs). A click from anyone else is refused with 403, changes no state, never
+reaches the executor, and is recorded as an ``unauthorized_decision`` audit
+event. The allowlist is required: an app without approvers cannot be built.
+
+A verified, allowlisted Approve records the APPROVED transition. If the proposal is
 EXECUTABLE, the executor runs after the response is sent (Slack wants an answer
 within three seconds); the executor records EXECUTED or FAILED itself. A
 verified Reject records REJECTED.
@@ -23,7 +28,7 @@ import html
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import parse_qs
@@ -50,6 +55,7 @@ class SupportsExecute(Protocol):
 class Decision:
     proposal_id: str
     approve: bool
+    user_id: str
     actor: str
 
 
@@ -73,11 +79,15 @@ def create_app(
     store: SqliteStore,
     *,
     signing_secret: str,
+    approver_ids: Collection[str],
     executor: SupportsExecute | None = None,
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     if not signing_secret:
         raise ValueError("a Slack signing secret is required")
+    if not approver_ids:
+        raise ValueError("an approver allowlist (approval.approver_ids) is required; it is empty")
+    approvers = frozenset(approver_ids)
     app = FastAPI(title="Bellwether", docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.post("/slack/actions")
@@ -96,6 +106,8 @@ def create_app(
             )
             raise HTTPException(status_code=401, detail="invalid Slack signature")
         decision = _parse_decision(body)
+        if decision.user_id not in approvers:
+            return await run_in_threadpool(_refuse, store, decision)
         return await run_in_threadpool(_decide, store, executor, decision, background)
 
     @app.get("/", response_class=HTMLResponse)
@@ -128,12 +140,22 @@ def create_app(
             f"<td>{_e(t.actor or '')}</td><td>{_e(t.result or '')}</td></tr>"
             for t in store.history(proposal_id)
         )
+        events = "".join(
+            f"<tr><td>{_e(e.at.strftime('%Y-%m-%d %H:%M:%S'))}</td><td>{_e(e.kind)}</td>"
+            f"<td>{_e(e.actor or '')}</td><td>{_e(e.detail)}</td></tr>"
+            for e in store.list_audit_events(proposal_id)
+        )
         body = (
             '<p><a href="/">&larr; all proposals</a></p>'
             f"<pre>{_e(render_text(proposal, record))}</pre>"
             "<h2>Audit trail</h2><table><thead><tr><th>At (UTC)</th><th>State</th>"
             f"<th>By</th><th>Result</th></tr></thead><tbody>{history}</tbody></table>"
         )
+        if events:
+            body += (
+                "<h2>Audit events</h2><table><thead><tr><th>At (UTC)</th><th>Event</th>"
+                f"<th>By</th><th>Detail</th></tr></thead><tbody>{events}</tbody></table>"
+            )
         return HTMLResponse(_page(f"Proposal {proposal_id}", body))
 
     @app.get("/healthz")
@@ -168,7 +190,33 @@ def _parse_decision(body: bytes) -> Decision:
     username = user.get("username") or user.get("name") if isinstance(user, dict) else None
     actor = f"slack:{username} ({user_id})" if username else f"slack:{user_id}"
     return Decision(
-        proposal_id=proposal_id, approve=action["action_id"] == APPROVE_ACTION_ID, actor=actor
+        proposal_id=proposal_id,
+        approve=action["action_id"] == APPROVE_ACTION_ID,
+        user_id=user_id,
+        actor=actor,
+    )
+
+
+def _refuse(store: SqliteStore, decision: Decision) -> JSONResponse:
+    """A verified click from someone outside the allowlist: record it, change nothing."""
+    verb = "approve" if decision.approve else "reject"
+    store.record_audit_event(
+        "unauthorized_decision",
+        proposal_id=decision.proposal_id,
+        actor=decision.actor,
+        detail=f"{verb} refused: Slack user {decision.user_id} is not in approval.approver_ids",
+    )
+    logger.warning(
+        "slack decision refused: user not in approver allowlist",
+        extra={"proposal_id": decision.proposal_id, "actor": decision.actor, "decision": verb},
+    )
+    return JSONResponse(
+        {
+            "ok": False,
+            "proposal_id": decision.proposal_id,
+            "message": f"{decision.actor} is not an authorized approver; nothing was changed",
+        },
+        status_code=403,
     )
 
 

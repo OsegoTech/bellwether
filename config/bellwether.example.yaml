@@ -53,6 +53,14 @@ notify:
     - stdout
     - slack
 
+approval:
+  # Slack user IDs (U…/W…, not display names) allowed to Approve or Reject from
+  # Slack. A verified click from anyone else is refused (403), changes nothing,
+  # and is recorded as an audit event. Empty = nobody: `bellwether serve`
+  # refuses to start until this is set.
+  # Env: BELLWETHER_APPROVAL__APPROVER_IDS='["U0123ABCD"]'
+  approver_ids: []
+
 store:
   sqlite_path: /var/lib/bellwether/bellwether.db
 

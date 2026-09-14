@@ -451,6 +451,41 @@ def test_executor_uri_must_name_the_replica_set(
         load_config(write_yaml(tmp_path, data))
 
 
+def test_approver_ids_default_to_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+
+    assert load_config(write_yaml(tmp_path, minimal())).approval.approver_ids == []
+
+
+def test_approver_ids_from_yaml_and_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["approval"] = {"approver_ids": ["U0OSEGO"]}
+    path = write_yaml(tmp_path, data)
+
+    assert load_config(path).approval.approver_ids == ["U0OSEGO"]
+
+    monkeypatch.setenv("BELLWETHER_APPROVAL__APPROVER_IDS", '["U0OSEGO", "W0TEAMMATE"]')
+    assert load_config(path).approval.approver_ids == ["U0OSEGO", "W0TEAMMATE"]
+
+
+@pytest.mark.parametrize("bad", ["osego", "@osego", "u0osego", "", "U0 OSEGO"])
+def test_approver_ids_must_be_slack_user_ids(
+    bad: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["approval"] = {"approver_ids": ["U0OSEGO", bad]}
+
+    with pytest.raises(ConfigError, match="approval.approver_ids"):
+        load_config(write_yaml(tmp_path, data))
+
+
+def test_example_allowlist_fails_closed(secrets_env: None) -> None:
+    # Nobody can approve from Slack until an operator names the approvers.
+    assert load_config(EXAMPLE_YAML).approval.approver_ids == []
+
+
 def test_example_executor_uri_is_a_replica_set_uri(secrets_env: None) -> None:
     uri = load_config(EXAMPLE_YAML).executor.mongo_uri
 

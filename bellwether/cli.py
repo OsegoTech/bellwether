@@ -69,9 +69,21 @@ def _serve(config: BellwetherConfig, args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if not config.approval.approver_ids:
+        print(
+            "bellwether: serve needs at least one Slack approver; set approval.approver_ids "
+            f"or {env_var_for('approval', 'approver_ids')}",
+            file=sys.stderr,
+        )
+        return 2
     store = pipeline.build_store(config)
     executor = pipeline.build_executor(config, store)
-    app = create_app(store, signing_secret=secret.get_secret_value(), executor=executor)
+    app = create_app(
+        store,
+        signing_secret=secret.get_secret_value(),
+        approver_ids=config.approval.approver_ids,
+        executor=executor,
+    )
     logger.info(
         "serving approval endpoint",
         extra={"host": args.host, "port": args.port, "executor_enabled": executor is not None},
@@ -108,6 +120,11 @@ def _show(config: BellwetherConfig, args: argparse.Namespace) -> int:
     for t in store.history(args.proposal_id):
         detail = " ".join(part for part in (t.actor, t.result) if part)
         print(f"  {t.at.isoformat()}  {t.state.value:9}  {detail}".rstrip())
+    events = store.list_audit_events(args.proposal_id)
+    if events:
+        print("\nAudit events:")
+        for e in events:
+            print(f"  {e.at.isoformat()}  {e.kind}  {e.actor or ''}  {e.detail}")
     return 0
 
 

@@ -207,7 +207,7 @@ def test_transition_cannot_predate_the_latest(store: SqliteStore) -> None:
         )
 
 
-@pytest.mark.parametrize("table", ["proposals", "approvals", "findings", "runs"])
+@pytest.mark.parametrize("table", ["proposals", "approvals", "findings", "runs", "audit_events"])
 def test_tables_reject_update_and_delete(store: SqliteStore, tmp_path: Path, table: str) -> None:
     proposal = make_proposal()
     store.record_proposal(proposal)
@@ -215,6 +215,7 @@ def test_tables_reject_update_and_delete(store: SqliteStore, tmp_path: Path, tab
     store.record_run(
         RunRecord(run_id="r1", started_at=T0, finished_at=T0, findings=1, proposals=1, errors=())
     )
+    store.record_audit_event("unauthorized_decision", proposal_id=proposal.proposal_id, detail="x")
 
     conn = sqlite3.connect(tmp_path / "bellwether.db")
     try:
@@ -224,6 +225,27 @@ def test_tables_reject_update_and_delete(store: SqliteStore, tmp_path: Path, tab
             conn.execute(f"DELETE FROM {table}")
     finally:
         conn.close()
+
+
+def test_audit_events_are_recorded_without_changing_state(store: SqliteStore) -> None:
+    proposal = make_proposal()
+    store.record_proposal(proposal)
+
+    event = store.record_audit_event(
+        "unauthorized_decision",
+        proposal_id=proposal.proposal_id,
+        actor="slack:mallory (U0MALLORY)",
+        detail="approve refused: U0MALLORY is not in approval.approver_ids",
+    )
+    store.record_audit_event("unauthorized_decision", detail="no proposal attached")
+
+    assert store.current_state(proposal.proposal_id).state is ApprovalState.PENDING
+    assert len(store.history(proposal.proposal_id)) == 1
+    [recorded] = store.list_audit_events(proposal.proposal_id)
+    assert recorded == event
+    assert recorded.kind == "unauthorized_decision"
+    assert recorded.actor == "slack:mallory (U0MALLORY)"
+    assert len(store.list_audit_events()) == 2
 
 
 def test_store_has_no_mutating_api() -> None:

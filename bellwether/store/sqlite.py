@@ -2,7 +2,9 @@
 
 Tables: ``proposals``, ``approvals``, ``runs`` (BUILD_SPEC §3.6), plus
 ``findings`` so the pipeline can record findings that were not analyzed (below
-the token gate, or with every provider down) — §3.5/§3.10 require them stored.
+the token gate, or with every provider down) — §3.5/§3.10 require them stored —
+and ``audit_events`` for things worth recording that change no state, such as
+a Slack click refused because the user is not in ``approval.approver_ids``.
 
 Append-only is enforced by the database, not by convention: every table has
 triggers that abort any UPDATE or DELETE. A proposal is written once. Its
@@ -40,7 +42,7 @@ from bellwether.store.codec import (
 
 logger = logging.getLogger(__name__)
 
-_TABLES = ("proposals", "approvals", "findings", "runs")
+_TABLES = ("proposals", "approvals", "findings", "runs", "audit_events")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS proposals (
@@ -83,6 +85,15 @@ CREATE TABLE IF NOT EXISTS runs (
     proposals   INTEGER NOT NULL,
     errors      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at          TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    proposal_id TEXT,
+    actor       TEXT,
+    detail      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_events_by_proposal ON audit_events (proposal_id, at, seq);
 """ + "".join(
     f"""
 CREATE TRIGGER IF NOT EXISTS {table}_no_update BEFORE UPDATE ON {table}
@@ -143,6 +154,16 @@ class FindingRow:
     horizon_seconds: int | None
     escalated: bool
     detected_at: datetime
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    seq: int
+    at: datetime
+    kind: str
+    proposal_id: str | None
+    actor: str | None
+    detail: str
 
 
 class SqliteStore:
@@ -328,6 +349,61 @@ class SqliteStore:
                 findings=r["findings"],
                 proposals=r["proposals"],
                 errors=tuple(json.loads(r["errors"])),
+            )
+            for r in rows
+        ]
+
+    # --- audit events ---------------------------------------------------------------
+
+    def record_audit_event(
+        self,
+        kind: str,
+        *,
+        detail: str,
+        proposal_id: str | None = None,
+        actor: str | None = None,
+        at: datetime | None = None,
+    ) -> AuditEvent:
+        """Record something that happened without changing any proposal's state."""
+        when = dt_to_str(at or datetime.now(timezone.utc))
+        with self._write() as conn:
+            cursor = conn.execute(
+                "INSERT INTO audit_events (at, kind, proposal_id, actor, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (when, kind, proposal_id, actor, detail),
+            )
+            seq = cursor.lastrowid
+        if seq is None:
+            raise RuntimeError("audit event insert returned no row id")
+        logger.info(
+            "audit event recorded",
+            extra={"event_kind": kind, "proposal_id": proposal_id, "actor": actor},
+        )
+        return AuditEvent(
+            seq=seq,
+            at=dt_from_str(when),
+            kind=kind,
+            proposal_id=proposal_id,
+            actor=actor,
+            detail=detail,
+        )
+
+    def list_audit_events(self, proposal_id: str | None = None) -> list[AuditEvent]:
+        query = "SELECT * FROM audit_events"
+        params: tuple[str, ...] = ()
+        if proposal_id is not None:
+            query += " WHERE proposal_id = ?"
+            params = (proposal_id,)
+        with self._read() as conn:
+            rows = conn.execute(query + " ORDER BY at, seq", params).fetchall()
+        return [
+            AuditEvent(
+                seq=r["seq"],
+                at=dt_from_str(r["at"]),
+                kind=r["kind"],
+                proposal_id=r["proposal_id"],
+                actor=r["actor"],
+                detail=r["detail"],
             )
             for r in rows
         ]

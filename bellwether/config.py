@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal, get_args
@@ -256,6 +257,29 @@ class ExecutorConfig(_Section):
         return self
 
 
+_SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{2,}$")
+
+
+class ApprovalConfig(_Section):
+    """Who may decide from Slack.
+
+    Slack user IDs, not display names: a name can be changed by its owner, an
+    ID cannot. Empty means nobody — the approval endpoint fails closed.
+    """
+
+    approver_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("approver_ids")
+    @classmethod
+    def _slack_user_ids(cls, value: list[str]) -> list[str]:
+        for user_id in value:
+            if not _SLACK_USER_ID.match(user_id):
+                raise ValueError(
+                    f"approval.approver_ids must be Slack user IDs like U0123ABCD, got {user_id!r}"
+                )
+        return value
+
+
 class OplogWindowCollectorConfig(_Section):
     # Gap between the two serverStatus reads that measure the live write rate.
     # 0 disables sampling; the collector then reports the oplog's mean rate.
@@ -299,6 +323,7 @@ class BellwetherConfig(BaseSettings):
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     collectors: CollectorsConfig = Field(default_factory=CollectorsConfig)
     detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
+    approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
 
     @classmethod
     def settings_customise_sources(
