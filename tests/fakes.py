@@ -183,6 +183,11 @@ def oplog_cluster(window_seconds: int) -> FakeCluster:
         {"storageStats": {"maxSize": 990 * 2**20, "size": 512 * 2**20}}
     ]
     cluster.reply("serverStatus", {"repl": {"setName": "rs0", "secondary": False}, "ok": 1.0})
+    # No application databases: the query profile collector finds nothing to read.
+    cluster.reply(
+        "listDatabases",
+        {"databases": [{"name": "admin"}, {"name": "config"}, {"name": "local"}], "ok": 1.0},
+    )
     return cluster
 
 

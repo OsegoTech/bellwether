@@ -367,6 +367,20 @@ def test_has_pending_for_failure_mode_and_node(store: SqliteStore) -> None:
     assert not store.has_pending("oplog_window_below_resync", NODE)
 
 
+def test_has_pending_can_be_narrowed_to_a_subject(store: SqliteStore) -> None:
+    # One node can carry many index findings: one pending proposal per query
+    # shape, not one per failure mode.
+    proposal = make_proposal(
+        failure_mode="missing_index_collscan",
+        evidence_refs=(Evidence("subject", "meetadev_ledger.transactions#aaaa", observed_at=T0),),
+    )
+    store.record_proposal(proposal)
+
+    assert store.has_pending("missing_index_collscan", NODE)
+    assert store.has_pending("missing_index_collscan", NODE, subject="meetadev_ledger.transactions#aaaa")
+    assert not store.has_pending("missing_index_collscan", NODE, subject="meetadev_ledger.transactions#bbbb")
+
+
 def test_findings_are_recorded(store: SqliteStore) -> None:
     finding = make_finding()
 

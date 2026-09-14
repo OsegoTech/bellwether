@@ -276,10 +276,19 @@ class SqliteStore:
     def list_pending(self) -> list[Proposal]:
         return [p for p, record in self.list_proposals() if record.state is ApprovalState.PENDING]
 
-    def has_pending(self, failure_mode: str, node: str) -> bool:
-        """Whether an undecided proposal already covers this failure mode on this node."""
+    def has_pending(self, failure_mode: str, node: str, subject: str | None = None) -> bool:
+        """Whether an undecided proposal already covers this failure mode on this node.
+
+        With `subject` (a finding's ``subject`` evidence — one query shape, one
+        index), only a pending proposal for that same subject counts: a node can
+        carry many index findings at once, and each deserves its own proposal.
+        """
         matches = self._proposals_where("WHERE failure_mode = ? AND node = ?", (failure_mode, node))
-        return any(record.state is ApprovalState.PENDING for _, record in matches)
+        return any(
+            record.state is ApprovalState.PENDING
+            and (subject is None or _subject(proposal) == subject)
+            for proposal, record in matches
+        )
 
     # --- findings and runs --------------------------------------------------------
 
@@ -453,6 +462,10 @@ class SqliteStore:
             conn.execute("COMMIT")
         finally:
             conn.close()
+
+
+def _subject(proposal: Proposal) -> object:
+    return next((e.value for e in proposal.evidence_refs if e.name == "subject"), None)
 
 
 def _transitions(conn: sqlite3.Connection, proposal_id: str) -> list[Transition]:

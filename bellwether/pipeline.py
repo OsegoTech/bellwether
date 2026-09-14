@@ -6,8 +6,12 @@
 Every finding is stored. Only findings at or above
 ``analysis.escalate_min_severity`` reach the analyst (the token gate), and a
 finding already covered by a PENDING proposal for the same failure mode and
-node is not re-analyzed, so a persistent condition does not spawn a proposal
-per timer tick. If analysis is unavailable the finding stays recorded
+node — and the same subject, for findings that carry one (one query shape,
+one index) — is not re-analyzed, so a persistent condition does not spawn a
+proposal per timer tick.
+
+Collectors: the oplog window and the query profile (the Index Advisor's
+input). Detectors: the oplog window and the Index Advisor. If analysis is unavailable the finding stays recorded
 un-analyzed; nothing is invented. Each run appends one ``runs`` row with its
 counts and errors, even when it aborts.
 
@@ -34,8 +38,10 @@ from bellwether.analysis.openai import OpenAIProvider
 from bellwether.analysis.provider import AnalysisUnavailable, Provider, ProviderChain
 from bellwether.collectors.base import Collector
 from bellwether.collectors.oplog_window import OplogWindowCollector
+from bellwether.collectors.query_profile import QueryProfileCollector
 from bellwether.config import BellwetherConfig
 from bellwether.detectors.base import Detector
+from bellwether.detectors.index_advisor import IndexAdvisorDetector
 from bellwether.detectors.oplog_window import OplogWindowDetector
 from bellwether.executor.executor import Executor
 from bellwether.models import Finding, Proposal, Signal
@@ -66,11 +72,17 @@ def build_mongo(config: BellwetherConfig) -> ReadOnlyMongo:
 
 
 def build_collectors(config: BellwetherConfig) -> list[Collector]:
-    return [OplogWindowCollector(config.collectors.oplog_window)]
+    return [
+        OplogWindowCollector(config.collectors.oplog_window),
+        QueryProfileCollector(config.collectors.query_profile),
+    ]
 
 
 def build_detectors(config: BellwetherConfig) -> list[Detector]:
-    return [OplogWindowDetector(config.detectors.oplog_window)]
+    return [
+        OplogWindowDetector(config.detectors.oplog_window),
+        IndexAdvisorDetector(config.detectors.index_advisor),
+    ]
 
 
 def build_providers(config: BellwetherConfig) -> list[Provider]:
@@ -162,7 +174,7 @@ def run_once(
             if not escalated:
                 logger.info("finding below escalation threshold; stored, not analyzed", extra=context)
                 continue
-            if store.has_pending(finding.failure_mode, finding.node):
+            if store.has_pending(finding.failure_mode, finding.node, _subject(finding)):
                 logger.info("a pending proposal already covers this finding; not re-analyzed", extra=context)
                 continue
             analyst = analyst or build_analyst(config)
@@ -224,7 +236,7 @@ def _collect(
         for collector in collectors if collectors is not None else build_collectors(config):
             logger.info("collector started", extra={"collector": collector.name})
             try:
-                signal = collector.collect(reader)
+                found = collector.collect_signals(reader)
             except Exception as exc:
                 errors.append(f"collector {collector.name}: {_describe(exc)}")
                 logger.exception("collector failed", extra={"collector": collector.name})
@@ -234,11 +246,10 @@ def _collect(
                 extra={
                     "collector": collector.name,
                     "node": reader.served_by,
-                    "signal": signal is not None,
+                    "signals": len(found),
                 },
             )
-            if signal is not None:
-                signals.append(signal)
+            signals.extend(found)
     finally:
         if mongo is None:
             reader.close()
@@ -254,18 +265,23 @@ def _detect(
     findings: list[Finding] = []
     for detector in detectors if detectors is not None else build_detectors(config):
         try:
-            finding = detector.evaluate(signals)
+            found = detector.evaluate_all(signals)
         except Exception as exc:
             errors.append(f"detector {detector.failure_mode}: {_describe(exc)}")
             logger.exception("detector failed", extra={"detector": detector.failure_mode})
             continue
         logger.info(
             "detector finished",
-            extra={"detector": detector.failure_mode, "finding": finding is not None},
+            extra={"detector": detector.failure_mode, "findings": len(found)},
         )
-        if finding is not None:
-            findings.append(finding)
+        findings.extend(found)
     return findings
+
+
+def _subject(finding: Finding) -> str | None:
+    """The finding's subject evidence (one query shape, one index), if it has one."""
+    value = next((e.value for e in finding.evidence if e.name == "subject"), None)
+    return None if value is None else str(value)
 
 
 def _secret(value: SecretStr | None, field: str) -> str:
