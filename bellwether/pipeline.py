@@ -117,7 +117,12 @@ def build_notifiers(config: BellwetherConfig) -> list[Notifier]:
 
 
 def build_executor(config: BellwetherConfig, store: SqliteStore) -> Executor | None:
-    return Executor(config.executor, store) if config.executor.enabled else None
+    if not config.executor.enabled:
+        return None
+    # kill_op may target any configured member, including the hidden backup
+    # node that is not a replica-set seed.
+    known = [config.mongo.target_node, *config.mongo.fallback_nodes]
+    return Executor(config.executor, store, known_nodes=known)
 
 
 # --- one pass ---------------------------------------------------------------------------

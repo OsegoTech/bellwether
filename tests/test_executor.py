@@ -22,6 +22,7 @@ import pytest
 from pymongo.errors import OperationFailure
 
 from bellwether.config import ExecutorConfig
+from bellwether.detectors.base import OP_NODE_EVIDENCE, OPID_EVIDENCE, killable_op_evidence
 from bellwether.executor import whitelist
 from bellwether.executor.executor import ExecutionRefused, Executor
 from bellwether.executor.whitelist import ActionNotWhitelisted, ActionRefused, InvalidActionArgs
@@ -37,9 +38,13 @@ from bellwether.mongo import ClientFactory
 from bellwether.store.sqlite import SqliteStore
 
 T0 = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+WESTEUROPE = "node-westeurope.mongo.internal:27017"
+UAE = "node-uae.mongo.internal:27017"
+SOUTHAFRICA = "node-southafrica.mongo.internal:27017"
+BACKUP = "node-backup.mongo.internal:27017"
 EXEC_URI = (
-    "mongodb://node-westeurope.mongo.internal:27017/"
-    "?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true"
+    f"mongodb://{WESTEUROPE},{UAE},{SOUTHAFRICA}/"
+    "?replicaSet=rs0&authMechanism=MONGODB-X509&authSource=%24external&tls=true"
 )
 EXEC_CERT = Path("/etc/bellwether/tls/meetadev-ai-exec.combined.pem")
 CA = Path("/etc/mongodb/tls/ca-chain.cert.pem")
@@ -161,11 +166,20 @@ def index_proposal(**arg_overrides: Any) -> Proposal:
     )
 
 
-def kill_proposal(opid: object = 4242, identified: tuple[int, ...] = (4242,)) -> Proposal:
+def kill_proposal(
+    opid: object = 4242,
+    identified: tuple[int, ...] = (4242,),
+    *,
+    op_node: str | None = UAE,
+    node: str = UAE,
+) -> Proposal:
+    evidence = tuple(Evidence(OPID_EVIDENCE, o, observed_at=T0) for o in identified)
+    if op_node is not None:
+        evidence += (Evidence(OP_NODE_EVIDENCE, op_node, observed_at=T0),)
     return Proposal(
         finding_id="f" * 32,
         failure_mode="runaway_operation",
-        node="node-uae.mongo.internal:27017",
+        node=node,
         diagnosis="Op 4242 has scanned for 900 s.",
         mechanism="Unbounded collection scan holding a ticket.",
         impact_if_ignored="Ticket exhaustion.",
@@ -180,7 +194,7 @@ def kill_proposal(opid: object = 4242, identified: tuple[int, ...] = (4242,)) ->
         ),
         confidence=0.9,
         provider="claude",
-        evidence_refs=tuple(Evidence("opid", o, observed_at=T0) for o in identified),
+        evidence_refs=evidence,
         created_at=T0,
     )
 
@@ -208,8 +222,12 @@ def world() -> FakeWorld:
     return FakeWorld()
 
 
-def make_executor(store: SqliteStore, world: FakeWorld, **config: Any) -> Executor:
-    return Executor(executor_config(**config), store, client_factory=world.factory())
+def make_executor(
+    store: SqliteStore, world: FakeWorld, known_nodes: tuple[str, ...] = (), **config: Any
+) -> Executor:
+    return Executor(
+        executor_config(**config), store, client_factory=world.factory(), known_nodes=known_nodes
+    )
 
 
 def approved(store: SqliteStore, proposal: Proposal) -> ApprovalRecord:
@@ -514,12 +532,114 @@ def test_write_identity_is_separate_and_passed_as_kwargs(
 
     client = world.clients[0]
     assert client.uri == EXEC_URI
+    assert client.kwargs["directConnection"] is False
     assert client.kwargs["tlsCertificateKeyFile"] == str(EXEC_CERT)
     assert client.kwargs["tlsCAFile"] == str(CA)
     assert client.kwargs["tls"] is True
     assert "tlsCertificateKeyFile" not in client.uri
     for insecure in ("tlsInsecure", "tlsAllowInvalidHostnames", "tlsAllowInvalidCertificates"):
         assert insecure not in client.kwargs
+
+
+# --- Correction A: per-action connection topology --------------------------------------
+
+
+def test_index_creation_routes_via_replica_set_uri(store: SqliteStore, world: FakeWorld) -> None:
+    proposal = index_proposal()
+
+    make_executor(store, world).execute(proposal, approved(store, proposal))
+
+    [client] = world.clients
+    assert client.uri == EXEC_URI
+    assert "replicaSet=rs0" in client.uri
+    for node in (WESTEUROPE, UAE, SOUTHAFRICA):
+        assert node in client.uri
+    assert client.kwargs["directConnection"] is False  # the driver finds the primary
+    assert world.indexes and world.commands == []
+
+
+def test_kill_op_connects_directly_to_the_findings_node(
+    store: SqliteStore, world: FakeWorld
+) -> None:
+    proposal = kill_proposal(op_node=SOUTHAFRICA, node=SOUTHAFRICA)
+
+    result = make_executor(store, world).execute(proposal, approved(store, proposal))
+
+    [client] = world.clients
+    assert client.uri.startswith(f"mongodb://{SOUTHAFRICA}/?")
+    assert "replicaSet" not in client.uri
+    assert "authMechanism=MONGODB-X509" in client.uri
+    assert "authSource=%24external" in client.uri
+    assert client.kwargs["directConnection"] is True
+    assert client.kwargs["tlsCertificateKeyFile"] == str(EXEC_CERT)
+    assert "tlsCertificateKeyFile" not in client.uri
+    assert world.commands == [("admin", {"killOp": 1, "op": 4242})]
+    assert result.state is ApprovalState.EXECUTED
+
+
+def test_kill_op_can_target_a_member_known_from_the_read_side(
+    store: SqliteStore, world: FakeWorld
+) -> None:
+    proposal = kill_proposal(op_node=BACKUP, node=BACKUP)  # hidden member, not an RS seed
+    record = approved(store, proposal)
+
+    make_executor(store, world, known_nodes=(BACKUP,)).execute(proposal, record)
+
+    assert world.clients[0].uri.startswith(f"mongodb://{BACKUP}/?")
+
+
+def test_kill_op_without_op_node_is_refused(store: SqliteStore, world: FakeWorld) -> None:
+    proposal = kill_proposal(op_node=None)
+    record = approved(store, proposal)
+
+    with pytest.raises(ActionRefused, match="op_node"):
+        make_executor(store, world).execute(proposal, record)
+
+    assert world.clients == []
+    assert store.current_state(proposal.proposal_id).state is ApprovalState.FAILED
+
+
+def test_kill_op_on_an_unknown_host_is_refused(store: SqliteStore, world: FakeWorld) -> None:
+    rogue = "mongo.attacker.example:27017"
+    proposal = kill_proposal(op_node=rogue, node=rogue)
+    record = approved(store, proposal)
+
+    with pytest.raises(ActionRefused, match="not a known"):
+        make_executor(store, world).execute(proposal, record)
+
+    assert world.clients == []
+
+
+def test_kill_op_node_must_match_the_finding(store: SqliteStore, world: FakeWorld) -> None:
+    proposal = kill_proposal(op_node=UAE, node=SOUTHAFRICA)
+    record = approved(store, proposal)
+
+    with pytest.raises(ActionRefused, match="disagrees"):
+        make_executor(store, world).execute(proposal, record)
+
+    assert world.clients == []
+
+
+def test_connections_are_reused_per_target(store: SqliteStore, world: FakeWorld) -> None:
+    executor = make_executor(store, world)
+    for proposal in (index_proposal(), index_proposal(), kill_proposal(), kill_proposal()):
+        executor.execute(proposal, approved(store, proposal))
+
+    uris = [c.uri for c in world.clients]
+    assert len(uris) == 2  # one replica-set client, one direct client to node-uae
+    assert uris[0] == EXEC_URI and uris[1].startswith(f"mongodb://{UAE}/?")
+
+
+def test_killable_op_evidence_is_what_the_executor_reads(
+    store: SqliteStore, world: FakeWorld
+) -> None:
+    base = kill_proposal()
+    proposal = replace(base, evidence_refs=killable_op_evidence(4242, UAE))
+
+    result = make_executor(store, world).execute(proposal, approved(store, proposal))
+
+    assert result.state is ApprovalState.EXECUTED
+    assert world.clients[0].uri.startswith(f"mongodb://{UAE}/?")
 
 
 def test_command_string_is_never_shell_executed(

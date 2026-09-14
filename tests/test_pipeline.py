@@ -295,3 +295,23 @@ def test_build_executor_is_none_unless_enabled(tmp_path: Path) -> None:
     config = config_in(tmp_path)
 
     assert pipeline.build_executor(config, SqliteStore(config.store.sqlite_path)) is None
+
+
+def test_build_executor_knows_every_configured_member(tmp_path: Path) -> None:
+    config = config_in(
+        tmp_path,
+        executor={
+            "enabled": True,
+            "mongo_uri": f"mongodb://{','.join(FALLBACKS)}/?replicaSet=rs0"
+            "&authMechanism=MONGODB-X509&authSource=%24external&tls=true",
+            "tls_cert_file": "/etc/bellwether/tls/meetadev-ai-exec.combined.pem",
+            "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
+            "allowed_actions": ["kill_op"],
+        },
+    )
+
+    executor = pipeline.build_executor(config, SqliteStore(config.store.sqlite_path))
+
+    assert executor is not None
+    # Replica-set seeds plus the read side's target (the hidden backup) and fallbacks.
+    assert {TARGET, *FALLBACKS} <= executor.known_nodes

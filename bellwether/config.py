@@ -216,8 +216,27 @@ class ExecutorConfig(_Section):
 
     @field_validator("mongo_uri")
     @classmethod
-    def _uri_carries_no_credentials(cls, value: str | None) -> str | None:
-        return None if value is None else _check_mongo_uri(value, "executor", "mongo_uri")
+    def _replica_set_uri(cls, value: str | None) -> str | None:
+        """A replica-set URI: index builds must reach the primary wherever it is.
+
+        kill_op does not use this topology — the executor connects directly to
+        the member running the op, reusing this URI's auth options.
+        """
+        if value is None:
+            return None
+        _check_mongo_uri(value, "executor", "mongo_uri")
+        options = {k.lower(): v for k, v in parse_qsl(urlsplit(value).query)}
+        if options.get("directconnection", "").lower() == "true":
+            raise ValueError(
+                "executor.mongo_uri must not set directConnection: index builds must route "
+                "to the primary (kill_op connects to the op's own node by itself)"
+            )
+        if not options.get("replicaset"):
+            raise ValueError(
+                "executor.mongo_uri must name the replica set (replicaSet=rs0) so the "
+                "driver routes writes to the primary"
+            )
+        return value
 
     @model_validator(mode="after")
     def _connection_when_enabled(self) -> ExecutorConfig:

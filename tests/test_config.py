@@ -51,11 +51,18 @@ READ_URI = (
 )
 
 
+# The write side routes through the replica set so index builds reach the primary.
+EXEC_RS_URI = (
+    "mongodb://node-westeurope.mongo.internal:27017,node-uae.mongo.internal:27017,"
+    "node-southafrica.mongo.internal:27017/"
+    "?replicaSet=rs0&authMechanism=MONGODB-X509&authSource=%24external&tls=true"
+)
+
+
 def executor_block(**overrides: Any) -> dict[str, Any]:
     block: dict[str, Any] = {
         "enabled": True,
-        "mongo_uri": "mongodb://node-westeurope.mongo.internal:27017/"
-        "?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true",
+        "mongo_uri": EXEC_RS_URI,
         "tls_cert_file": "/etc/bellwether/tls/meetadev-ai-exec.combined.pem",
         "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
         "allowed_actions": ["kill_op"],
@@ -414,6 +421,44 @@ def test_example_uris_carry_no_cert_paths(secrets_env: None) -> None:
     for uri in (cfg.mongo.uri, cfg.executor.mongo_uri or ""):
         assert "tlsCertificateKeyFile" not in uri
         assert "tlsCAFile" not in uri
+
+
+# --- Correction A: the executor routes through the replica set -----------------------
+
+
+def test_executor_uri_must_not_use_direct_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["executor"] = executor_block(mongo_uri=EXEC_RS_URI + "&directConnection=true")
+
+    with pytest.raises(ConfigError, match="directConnection"):
+        load_config(write_yaml(tmp_path, data))
+
+
+def test_executor_uri_must_name_the_replica_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    data = minimal()
+    data["executor"] = executor_block(
+        mongo_uri="mongodb://node-westeurope.mongo.internal:27017,node-uae.mongo.internal:27017/"
+        "?authMechanism=MONGODB-X509&authSource=%24external&tls=true"
+    )
+
+    with pytest.raises(ConfigError, match="replicaSet"):
+        load_config(write_yaml(tmp_path, data))
+
+
+def test_example_executor_uri_is_a_replica_set_uri(secrets_env: None) -> None:
+    uri = load_config(EXAMPLE_YAML).executor.mongo_uri
+
+    assert uri is not None
+    assert "replicaSet=rs0" in uri
+    assert "directConnection" not in uri
+    for node in FALLBACK_ORDER:  # every voting member seeds the connection
+        assert node in uri
 
 
 def test_primary_and_fallback_must_differ(

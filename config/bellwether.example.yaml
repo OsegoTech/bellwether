@@ -73,8 +73,12 @@ executor:
   # Write identity meetadev-ai-exec — distinct from the read identity above,
   # with its own cert. Off until an operator deliberately turns it on.
   enabled: false
-  # PLACEHOLDER — the meetadev-ai-exec connection has not been provisioned.
-  mongo_uri: "mongodb://node-westeurope.mongo.internal:27017/?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true"
+  # Replica-set URI: every voting member, replicaSet=rs0, NO directConnection,
+  # so create_small_index goes wherever the driver finds the primary. kill_op
+  # instead connects directly to the member the runaway op runs on (the
+  # finding's node), reusing this URI's auth options with that single host.
+  # PLACEHOLDER — the meetadev-ai-exec identity has not been provisioned.
+  mongo_uri: "mongodb://node-westeurope.mongo.internal:27017,node-uae.mongo.internal:27017,node-southafrica.mongo.internal:27017/?replicaSet=rs0&authMechanism=MONGODB-X509&authSource=%24external&tls=true"
   tls_cert_file: /etc/bellwether/tls/meetadev-ai-exec.combined.pem  # PLACEHOLDER path
   tls_ca_file: /etc/mongodb/tls/ca-chain.cert.pem
   # create_small_index refuses collections estimated above this many documents.
