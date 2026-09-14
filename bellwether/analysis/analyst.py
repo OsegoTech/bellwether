@@ -7,6 +7,13 @@ ProviderChain, validates the answer against the proposal schema
 (``schema.py``), and returns a Proposal. Invalid output is rejected and
 retried by the chain; never coerced.
 
+Some rules are about the answer *relative to this finding*, which a schema
+cannot express. ``check_grounded`` enforces them deterministically: an
+executable ``create_small_index`` must build exactly the ESR candidate index
+the detector computed, on the finding's collection, with the finding's
+document count, under the executor's threshold. The model may decide *whether*
+to build an index; it never decides which fields or in what order.
+
 The analyst never touches the cluster. It only ever sees a Finding that a
 deterministic detector already produced.
 """
@@ -19,7 +26,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from bellwether.analysis.provider import ProviderChain
-from bellwether.analysis.schema import ProposalPayload, validate_payload
+from bellwether.analysis.schema import CreateSmallIndexArgs, ProposalPayload, validate_payload
 from bellwether.config import MongoConfig
 from bellwether.models import ActionKind, Finding, Proposal, RemediationAction
 
@@ -122,6 +129,35 @@ KNOWN_MECHANISMS: dict[str, str] = {
         "plausibly be offline for routine maintenance; a window below that estimate "
         "means routine maintenance could trigger a full resync."
     ),
+    "missing_index_collscan": (
+        "A query with no supporting index runs a COLLSCAN: it examines every document "
+        "in the collection to find the few that match. The targeting ratio is "
+        "documents examined per document returned; 1.0 is perfect, and everything "
+        "above it is documents read for nothing. An index lets the query examine only "
+        "the matching documents. The ESR ordering — equality fields first, then sort "
+        "fields, then range fields — is what makes one compound index usable for both "
+        "the predicate and the sort: equality narrows the scan to one contiguous key "
+        "range, the sort then reads that range already in order, and range bounds "
+        "apply last. Every index also adds write cost, since each insert, update and "
+        "delete maintains every index on the collection, so an index is only worth it "
+        "when the read saving exceeds the write tax."
+    ),
+    "profiler_disabled": (
+        "The database profiler records slow operations to the capped collection "
+        "system.profile. Without it, Community Edition keeps no slow-query history to "
+        "analyse. Level 1 records only operations slower than slowms. The overhead is "
+        "a write to a capped collection per slow operation — usually negligible, but "
+        "real — which is why enabling it is a human decision. The profiler level is "
+        "per mongod and is not replicated to other members."
+    ),
+    "redundant_index": (
+        "An unused index, or one that is a prefix of another index serving the same "
+        "queries, costs write throughput and disk for no read benefit: every write "
+        "maintains it. Dropping it is safe only when it is genuinely unused — index "
+        "usage counters are per mongod and reset on restart, so unused on one member "
+        "is not unused everywhere — and not backing a constraint, which is why it is "
+        "always propose-only."
+    ),
 }
 
 # Remediation patterns per failure mode: MongoDB facts handed to the model as
@@ -137,6 +173,31 @@ KNOWN_REMEDIATIONS: dict[str, tuple[str, ...]] = {
         "updates, TTL deletes.",
         "Until the window is grown, keep any secondary's maintenance shorter than the "
         "current window.",
+    ),
+    "missing_index_collscan": (
+        "Build the ESR candidate index from the evidence exactly as given — its field "
+        "order and directions are computed, not chosen: create_small_index when "
+        "collection_doc_count is under the executor threshold, otherwise a propose-only "
+        "db.<collection>.createIndex(...) for a human to run, with the build-cost caveat.",
+        "Weigh the read saving against the write tax: every insert, update and delete on "
+        "the collection maintains every index.",
+        "Check existing_indexes first: extending or replacing an index that already holds "
+        "the equality prefix beats adding a near-duplicate.",
+        "An index build on a large collection consumes CPU and I/O on every member and "
+        "replicates; schedule it off-peak.",
+    ),
+    "profiler_disabled": (
+        "Enable the profiler for slow operations only: "
+        "db.getSiblingDB('<db>').setProfilingLevel(1, { slowms: 100 }) (propose-only; per "
+        "mongod — run it on each member whose queries should be analysed).",
+        "To survive restarts, set operationProfiling.mode: slowOp and "
+        "operationProfiling.slowOpThresholdMs: 100 in mongod.conf.",
+    ),
+    "redundant_index": (
+        "Hide the index first with db.<collection>.hideIndex('<name>') (MongoDB 4.4+) to "
+        "test the effect reversibly (propose-only).",
+        "Drop it only after confirming it is unused on every member and not needed by rare "
+        "jobs: db.<collection>.dropIndex('<name>') (propose-only, never executable).",
     ),
 }
 
@@ -180,6 +241,62 @@ def replica_set_name(mongo: MongoConfig) -> str:
     return options.get("replicaset") or DEFAULT_REPLICA_SET
 
 
+# The executor's default document_threshold; pipeline.build_analyst passes the
+# configured value.
+DEFAULT_DOCUMENT_THRESHOLD = 100_000
+
+
+def check_grounded(
+    payload: ProposalPayload, finding: Finding, document_threshold: int
+) -> ProposalPayload:
+    """Reject an executable create_small_index not grounded in this finding's evidence.
+
+    Raises ValueError (a failed attempt: the chain retries, then fails over)
+    unless the keys are the evidence's ``candidate_index`` verbatim, db and
+    collection are the finding's, ``estimated_docs`` is the evidence's
+    ``collection_doc_count``, and that count is within the executor threshold.
+    Propose-only actions and kill_op (checked by the executor against the
+    finding's evidence) pass through.
+    """
+    action = payload.action
+    args = action.executor_args
+    if action.executor_op != "create_small_index" or not isinstance(args, CreateSmallIndexArgs):
+        return payload
+    evidence = {e.name: e.value for e in finding.evidence}
+    candidate = evidence.get("candidate_index")
+    if not candidate:
+        raise ValueError(
+            "create_small_index proposed, but the finding carries no candidate_index to build"
+        )
+    keys = [{"field": k.field, "direction": k.direction} for k in args.keys]
+    if keys != list(candidate):
+        raise ValueError(
+            "create_small_index keys must be the finding's candidate_index verbatim; "
+            "the model does not choose index fields, their order, or their directions"
+        )
+    target = (evidence.get("db"), evidence.get("collection"))
+    if (args.db, args.collection) != target:
+        raise ValueError(
+            f"create_small_index must target the finding's collection {target[0]}.{target[1]}"
+        )
+    count = evidence.get("collection_doc_count")
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise ValueError(
+            "create_small_index needs the finding's collection_doc_count, which is unknown; "
+            "propose a createIndex command instead"
+        )
+    if count > document_threshold:
+        raise ValueError(
+            f"the collection holds {count} documents, over the {document_threshold}-document "
+            "executor threshold; propose a createIndex command instead"
+        )
+    if args.estimated_docs != count:
+        raise ValueError(
+            "create_small_index estimated_docs must be the finding's collection_doc_count"
+        )
+    return payload
+
+
 class Analyst:
     def __init__(
         self,
@@ -187,10 +304,17 @@ class Analyst:
         *,
         topology: str = "",
         replica_set: str = DEFAULT_REPLICA_SET,
+        document_threshold: int = DEFAULT_DOCUMENT_THRESHOLD,
     ) -> None:
         self._chain = chain
         self._topology = topology
         self._replica_set = replica_set
+        self._document_threshold = document_threshold
+
+    @property
+    def document_threshold(self) -> int:
+        """The executor's create_small_index ceiling, enforced here as well."""
+        return self._document_threshold
 
     def build_context(self, finding: Finding) -> dict[str, Any]:
         return {
@@ -202,7 +326,10 @@ class Analyst:
 
     def analyze(self, finding: Finding) -> Proposal:
         """Raises AnalysisUnavailable if no provider produces a valid proposal."""
-        provider, payload = self._chain.run(finding, self.build_context(finding), validate_payload)
+        def validate(raw: dict[str, Any]) -> ProposalPayload:
+            return check_grounded(validate_payload(raw), finding, self._document_threshold)
+
+        provider, payload = self._chain.run(finding, self.build_context(finding), validate)
         proposal = to_proposal(payload, finding, provider)
         logger.info(
             "proposal produced",

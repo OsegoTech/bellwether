@@ -297,6 +297,12 @@ def test_build_analyst_grounds_the_prompt_in_config(tmp_path: Path) -> None:
     assert context["mechanism"]
 
 
+def test_build_analyst_uses_the_executor_document_threshold(tmp_path: Path) -> None:
+    config = config_in(tmp_path, executor={"document_threshold": 12_345})
+
+    assert pipeline.build_analyst(config).document_threshold == 12_345
+
+
 def test_build_providers_single_provider(tmp_path: Path) -> None:
     config = config_in(tmp_path, analysis={"fallback_provider": None})
 

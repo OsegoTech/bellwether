@@ -342,10 +342,12 @@ def test_parse_json_object() -> None:
 # --- Payload -> Proposal -----------------------------------------------------
 
 
-def test_executable_index_proposal_maps_args(finding: Finding) -> None:
+def test_executable_index_proposal_maps_args() -> None:
+    # create_small_index must be grounded in an index finding (see §F tests below).
+    grounded = index_finding(candidate=[{"field": "account_id", "direction": 1}], count=40_000)
     analyst, _, _ = analyst_with([VALID_INDEX], [VALID])
 
-    proposal = analyst.analyze(finding)
+    proposal = analyst.analyze(grounded)
 
     assert proposal.action.kind is ActionKind.EXECUTABLE
     assert proposal.action.executor_op == "create_small_index"
@@ -595,6 +597,185 @@ def test_replica_set_name_comes_from_the_uri_else_the_documented_default() -> No
 
     assert replica_set_name(_mongo_config(named)) == "ledger0"
     assert replica_set_name(_mongo_config(unnamed)) == DEFAULT_REPLICA_SET == "rs0"
+
+
+# --- Index Advisor grounding (INDEX_ADVISOR_SPEC §F) -------------------------------
+
+INDEX_CANDIDATE: list[dict[str, Any]] = [
+    {"field": "account_id", "direction": 1},
+    {"field": "status", "direction": 1},
+    {"field": "posted_at", "direction": -1},
+]
+INDEX_MODES = ("missing_index_collscan", "profiler_disabled", "redundant_index")
+
+
+def index_finding(
+    *,
+    candidate: list[dict[str, Any]] | None = None,
+    count: int | None = 40_000,
+    collection: str = "transactions",
+) -> Finding:
+    """A missing_index_collscan finding shaped like IndexAdvisorDetector's."""
+    namespace = f"meetadev_ledger.{collection}"
+    return Finding(
+        signal_class=SignalClass.PERFORMANCE,
+        failure_mode="missing_index_collscan",
+        severity=Severity.WARNING,
+        node=TARGET,
+        summary=(
+            f"Query shape {{account_id: eq, posted_at: range, status: eq}} sort {{posted_at: -1}} "
+            f"on {namespace} examined 1,000,000 documents to return 1,000."
+        ),
+        evidence=(
+            Evidence("db", "meetadev_ledger"),
+            Evidence("collection", collection),
+            Evidence("namespace", namespace),
+            Evidence("subject", f"{namespace}#0123456789abcdef"),
+            Evidence("query_shape", {"filter": {"account_id": "eq", "posted_at": "range", "status": "eq"}, "sort": [["posted_at", -1]]}),
+            Evidence("targeting_ratio", 1000.0),
+            Evidence("wasted_bytes", 435_564_000, "bytes"),
+            Evidence("candidate_index", INDEX_CANDIDATE if candidate is None else candidate),
+            Evidence("existing_indexes", [{"name": "_id_", "key": [{"field": "_id", "direction": 1}]}]),
+            Evidence("collection_doc_count", count, "docs"),
+        ),
+    )
+
+
+def index_payload(
+    keys: list[dict[str, Any]] | None = None,
+    *,
+    db: str = "meetadev_ledger",
+    collection: str = "transactions",
+    estimated_docs: int = 40_000,
+) -> dict[str, Any]:
+    return {
+        **VALID,
+        "action": {
+            "kind": "executable",
+            "title": "Index the hot transactions shape",
+            "command": "db.transactions.createIndex({ account_id: 1, status: 1, posted_at: -1 })",
+            "rationale": "The ESR candidate from the evidence.",
+            "reversible": True,
+            "executor_op": "create_small_index",
+            "executor_args": {
+                "db": db,
+                "collection": collection,
+                "keys": INDEX_CANDIDATE if keys is None else keys,
+                "estimated_docs": estimated_docs,
+            },
+        },
+    }
+
+
+def test_index_failure_modes_have_mechanisms_and_remediations() -> None:
+    for mode in INDEX_MODES:
+        assert KNOWN_MECHANISMS[mode].strip(), mode
+        assert KNOWN_REMEDIATIONS[mode], mode
+    assert "ESR" in KNOWN_MECHANISMS["missing_index_collscan"]
+    assert "write" in KNOWN_MECHANISMS["missing_index_collscan"]
+    assert "system.profile" in KNOWN_MECHANISMS["profiler_disabled"]
+    assert "propose-only" in KNOWN_MECHANISMS["redundant_index"]
+
+
+def test_prompt_carries_the_candidate_and_existing_indexes() -> None:
+    finding = index_finding()
+    analyst = Analyst(ProviderChain([ScriptedProvider("claude", [VALID])]), topology=TOPOLOGY)
+
+    prompt = render_prompt(finding, analyst.build_context(finding))
+
+    evidence = {e.name: e for e in finding.evidence}
+    assert evidence["candidate_index"].render() in prompt
+    assert evidence["existing_indexes"].render() in prompt
+    assert KNOWN_MECHANISMS["missing_index_collscan"] in prompt
+
+
+def test_grounded_create_small_index_is_accepted() -> None:
+    analyst, claude, _ = analyst_with([index_payload()], [VALID])
+
+    proposal = analyst.analyze(index_finding())
+
+    assert proposal.provider == "claude"
+    assert proposal.action.kind is ActionKind.EXECUTABLE
+    assert proposal.action.executor_args["keys"] == INDEX_CANDIDATE
+    assert proposal.action.executor_args["estimated_docs"] == 40_000
+    assert claude.calls == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        index_payload([INDEX_CANDIDATE[1], INDEX_CANDIDATE[0], INDEX_CANDIDATE[2]]),
+        index_payload([INDEX_CANDIDATE[0], INDEX_CANDIDATE[1], {"field": "posted_at", "direction": 1}]),
+        index_payload(INDEX_CANDIDATE[:2]),
+        index_payload([*INDEX_CANDIDATE, {"field": "amount", "direction": 1}]),
+    ],
+    ids=["field order changed", "direction changed", "field dropped", "field added"],
+)
+def test_the_model_can_never_choose_the_index_keys(payload: dict[str, Any]) -> None:
+    analyst, claude, gpt = analyst_with([payload], [payload])
+
+    with pytest.raises(AnalysisUnavailable) as excinfo:
+        analyst.analyze(index_finding())
+
+    assert (claude.calls, gpt.calls) == (2, 2)  # rejected and retried, never coerced
+    assert "candidate_index" in str(excinfo.value)
+
+
+def test_ungrounded_keys_fall_over_to_a_grounded_fallback() -> None:
+    reordered = index_payload([INDEX_CANDIDATE[1], INDEX_CANDIDATE[0], INDEX_CANDIDATE[2]])
+    analyst, _, _ = analyst_with([reordered], [index_payload()])
+
+    assert analyst.analyze(index_finding()).provider == "openai"
+
+
+def test_create_small_index_over_the_executor_threshold_is_rejected() -> None:
+    big = index_finding(count=5_000_000)
+    analyst, _, _ = analyst_with([index_payload(estimated_docs=5_000_000)], [VALID])
+
+    proposal = analyst.analyze(big)
+
+    assert proposal.provider == "openai"  # the primary's executable proposal was refused
+    assert proposal.action.kind is ActionKind.PROPOSE_ONLY  # a human runs createIndex
+
+
+def test_the_threshold_is_the_analysts() -> None:
+    chain = ProviderChain([ScriptedProvider("claude", [index_payload()])], max_retries=0)
+
+    with pytest.raises(AnalysisUnavailable, match="threshold"):
+        Analyst(chain, document_threshold=10_000).analyze(index_finding(count=40_000))
+
+
+@pytest.mark.parametrize(
+    ("finding_kwargs", "payload"),
+    [
+        ({}, index_payload(collection="accounts")),
+        ({}, index_payload(db="billing")),
+        ({}, index_payload(estimated_docs=39_000)),
+        ({"count": None}, index_payload()),
+    ],
+    ids=["wrong collection", "wrong db", "estimate not from evidence", "doc count unknown"],
+)
+def test_create_small_index_args_must_come_from_the_evidence(
+    finding_kwargs: dict[str, Any], payload: dict[str, Any]
+) -> None:
+    analyst, _, _ = analyst_with([payload], [payload])
+
+    with pytest.raises(AnalysisUnavailable):
+        analyst.analyze(index_finding(**finding_kwargs))
+
+
+def test_create_small_index_needs_an_index_finding(finding: Finding) -> None:
+    # The oplog finding carries no candidate index: nothing to build.
+    analyst, _, _ = analyst_with([index_payload()], [index_payload()])
+
+    with pytest.raises(AnalysisUnavailable, match="candidate_index"):
+        analyst.analyze(finding)
+
+
+def test_propose_only_is_accepted_for_an_index_finding() -> None:
+    analyst, _, _ = analyst_with([VALID], [VALID])
+
+    assert analyst.analyze(index_finding()).action.kind is ActionKind.PROPOSE_ONLY
 
 
 # --- Claude and OpenAI wrappers (SDK clients faked, no network) -------------

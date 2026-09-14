@@ -102,6 +102,7 @@ def build_analyst(config: BellwetherConfig) -> Analyst:
         chain,
         topology=topology_summary(config.mongo),
         replica_set=replica_set_name(config.mongo),
+        document_threshold=config.executor.document_threshold,
     )
 
 
