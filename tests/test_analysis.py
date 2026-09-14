@@ -1,0 +1,627 @@
+"""Acceptance tests for the analysis stage — BUILD_SPEC §3.5.
+
+Spec acceptance (unit, mocked providers):
+  - a mocked primary returning valid JSON yields a Proposal referencing the finding_id
+  - a mocked primary returning garbage twice, with a fallback returning valid
+    JSON, yields a Proposal with provider == "openai"
+  - both failing raises AnalysisUnavailable
+  - a provider returning JSON that violates the schema is rejected
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+
+import anthropic
+import httpx2
+import jsonschema
+import openai
+import pytest
+
+from bellwether.analysis import analyst as analyst_module
+from bellwether.analysis.analyst import KNOWN_REMEDIATIONS, PROMPT_TEMPLATE, Analyst, render_prompt
+from bellwether.analysis.claude import ClaudeProvider
+from bellwether.analysis.openai import OpenAIProvider
+from bellwether.analysis.provider import (
+    AnalysisUnavailable,
+    InvalidResponse,
+    Provider,
+    ProviderChain,
+    ProviderError,
+    parse_json_object,
+)
+from bellwether.analysis.schema import PROPOSAL_SCHEMA, ProposalPayload, validate_payload, wire_schema
+from bellwether.models import (
+    ActionKind,
+    Evidence,
+    Finding,
+    Severity,
+    Signal,
+    SignalClass,
+)
+
+SCHEMA_FILE = Path(__file__).resolve().parents[1] / "config" / "proposal.schema.json"
+TARGET = "node-backup.mongo.internal:27017"
+
+VALID: dict[str, Any] = {
+    "diagnosis": "The oplog holds 40 minutes of history, less than a 60 minute maintenance window.",
+    "mechanism": "local.oplog.rs is capped by size; a higher write rate truncates older entries sooner.",
+    "impact_if_ignored": "A secondary down for maintenance longer than 40 minutes needs a full initial sync.",
+    "action": {
+        "kind": "propose_only",
+        "title": "Grow the oplog on every member",
+        "command": "db.adminCommand({ replSetResizeOplog: 1, size: 51200 })",
+        "rationale": "A larger oplog restores a window above the resync estimate.",
+        "reversible": True,
+        "executor_op": None,
+        "executor_args": None,
+    },
+    "confidence": 0.82,
+}
+
+VALID_KILL_OP: dict[str, Any] = {
+    **VALID,
+    "action": {
+        "kind": "executable",
+        "title": "Kill the runaway collection scan",
+        "command": "db.killOp(4242)",
+        "rationale": "Op 4242 has held the lock for 900 s.",
+        "reversible": True,
+        "executor_op": "kill_op",
+        "executor_args": {"opid": 4242},
+    },
+}
+
+VALID_INDEX: dict[str, Any] = {
+    **VALID,
+    "action": {
+        "kind": "executable",
+        "title": "Index transactions.account_id",
+        "command": "db.transactions.createIndex({ account_id: 1 })",
+        "rationale": "Every slow query filters on account_id.",
+        "reversible": True,
+        "executor_op": "create_small_index",
+        "executor_args": {
+            "db": "meetadev_ledger",
+            "collection": "transactions",
+            "keys": [{"field": "account_id", "direction": 1}],
+            "estimated_docs": 40_000,
+        },
+    },
+}
+
+
+def mutated(path: str, value: Any = ..., base: dict[str, Any] = VALID) -> dict[str, Any]:
+    """A copy of `base` with dotted `path` set to `value` (or deleted if omitted)."""
+    doc = copy.deepcopy(base)
+    *parents, leaf = path.split(".")
+    node = doc
+    for key in parents:
+        node = node[key]
+    if value is ...:
+        del node[leaf]
+    else:
+        node[leaf] = value
+    return doc
+
+
+@pytest.fixture
+def finding() -> Finding:
+    signal = Signal(
+        signal_class=SignalClass.REPLICATION,
+        source="oplog_window",
+        node=TARGET,
+        evidence=(Evidence("oplog_window_seconds", 2400, "s"),),
+    )
+    return Finding(
+        signal_class=SignalClass.REPLICATION,
+        failure_mode="oplog_window_below_resync",
+        severity=Severity.CRITICAL,
+        node=TARGET,
+        summary=(
+            f"Oplog window on {TARGET} is 40 min (2400 s), below the 60 min (3600 s) "
+            "resync estimate."
+        ),
+        evidence=(
+            Evidence("oplog_window_seconds", 2400, "s"),
+            Evidence("resync_seconds", 3600, "s"),
+        ),
+        horizon_seconds=0,
+        signals=(signal,),
+    )
+
+
+class ScriptedProvider(Provider):
+    """Replays a script: dicts are returned, strings parsed as raw model text,
+    exceptions raised. The last entry repeats."""
+
+    def __init__(self, name: str, script: list[object]) -> None:
+        self.name = name
+        self.script = list(script)
+        self.calls = 0
+        self.contexts: list[dict[str, Any]] = []
+
+    def analyze(self, finding: Finding, context: dict[str, Any]) -> dict[str, Any]:
+        self.calls += 1
+        self.contexts.append(dict(context))
+        item = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, str):
+            return parse_json_object(item)
+        return copy.deepcopy(cast(dict[str, Any], item))
+
+
+def analyst_with(primary: list[object], fallback: list[object]) -> tuple[Analyst, ScriptedProvider, ScriptedProvider]:
+    claude = ScriptedProvider("claude", primary)
+    gpt = ScriptedProvider("openai", fallback)
+    chain = ProviderChain([claude, gpt], max_retries=1)
+    return Analyst(chain, topology="target node-backup (hidden); fallbacks westeurope, uae"), claude, gpt
+
+
+# --- Spec acceptance ---------------------------------------------------------
+
+
+def test_valid_primary_yields_proposal_for_the_finding(finding: Finding) -> None:
+    analyst, claude, gpt = analyst_with([VALID], [VALID])
+
+    proposal = analyst.analyze(finding)
+
+    assert proposal.finding_id == finding.finding_id
+    assert proposal.provider == "claude"
+    assert proposal.failure_mode == finding.failure_mode
+    assert proposal.node == finding.node
+    assert proposal.evidence_refs == finding.evidence
+    assert proposal.diagnosis == VALID["diagnosis"]
+    assert proposal.confidence == pytest.approx(0.82)
+    assert proposal.action.kind is ActionKind.PROPOSE_ONLY
+    assert proposal.action.executor_op is None
+    assert proposal.action.executor_args == {}
+    assert (claude.calls, gpt.calls) == (1, 0)
+
+
+def test_garbage_twice_then_fallback_yields_openai_proposal(finding: Finding) -> None:
+    analyst, claude, gpt = analyst_with(["not json at all", "{still: not json"], [VALID])
+
+    proposal = analyst.analyze(finding)
+
+    assert proposal.provider == "openai"
+    assert proposal.finding_id == finding.finding_id
+    assert (claude.calls, gpt.calls) == (2, 1)
+
+
+def test_both_failing_raises_analysis_unavailable(finding: Finding) -> None:
+    analyst, claude, gpt = analyst_with(["garbage"], [ProviderError("timed out after 60 s")])
+
+    with pytest.raises(AnalysisUnavailable) as excinfo:
+        analyst.analyze(finding)
+
+    assert (claude.calls, gpt.calls) == (2, 2)
+    message = str(excinfo.value)
+    assert "claude" in message and "openai" in message
+
+
+SCHEMA_VIOLATIONS = {
+    "missing diagnosis": mutated("diagnosis"),
+    "extra top-level field": {**VALID, "provider": "claude"},
+    "model tries to set finding_id": {**VALID, "finding_id": "forged"},
+    "confidence above 1": mutated("confidence", 1.5),
+    "confidence below 0": mutated("confidence", -0.1),
+    "confidence as string": mutated("confidence", "0.9"),
+    "empty diagnosis": mutated("diagnosis", ""),
+    "unknown action kind": mutated("action.kind", "maybe"),
+    "reversible as string": mutated("action.reversible", "true"),
+    "missing command": mutated("action.command"),
+    "extra action field": mutated("action.shell", "rm -rf /"),
+    "executable without op": mutated("action.kind", "executable"),
+    "propose_only with op": mutated("action.executor_op", "kill_op", base=VALID),
+    "op outside whitelist": mutated("action.executor_op", "drop_database", base=VALID_KILL_OP),
+    "kill_op with index args": mutated(
+        "action.executor_args", VALID_INDEX["action"]["executor_args"], base=VALID_KILL_OP
+    ),
+    "opid as string": mutated("action.executor_args", {"opid": "4242"}, base=VALID_KILL_OP),
+    "opid as bool": mutated("action.executor_args", {"opid": True}, base=VALID_KILL_OP),
+    "index direction 2": mutated(
+        "action.executor_args.keys", [{"field": "a", "direction": 2}], base=VALID_INDEX
+    ),
+    "index with no keys": mutated("action.executor_args.keys", [], base=VALID_INDEX),
+    "executable marked irreversible": mutated("action.reversible", False, base=VALID_KILL_OP),
+}
+
+
+@pytest.mark.parametrize("payload", SCHEMA_VIOLATIONS.values(), ids=SCHEMA_VIOLATIONS.keys())
+def test_schema_violations_are_rejected(finding: Finding, payload: dict[str, Any]) -> None:
+    analyst, claude, gpt = analyst_with([payload], [payload])
+
+    with pytest.raises(AnalysisUnavailable):
+        analyst.analyze(finding)
+
+    assert (claude.calls, gpt.calls) == (2, 2)  # retried, then failed over, never coerced
+
+
+def test_schema_violating_primary_falls_over_to_valid_fallback(finding: Finding) -> None:
+    analyst, _, _ = analyst_with([SCHEMA_VIOLATIONS["confidence as string"]], [VALID])
+
+    assert analyst.analyze(finding).provider == "openai"
+
+
+# --- ProviderChain -----------------------------------------------------------
+
+
+def test_retry_within_primary_before_failing_over(finding: Finding) -> None:
+    analyst, claude, gpt = analyst_with(["garbage", VALID], [VALID])
+
+    proposal = analyst.analyze(finding)
+
+    assert proposal.provider == "claude"
+    assert (claude.calls, gpt.calls) == (2, 0)
+
+
+def test_max_retries_zero_means_one_attempt(finding: Finding) -> None:
+    claude = ScriptedProvider("claude", ["garbage"])
+    gpt = ScriptedProvider("openai", [VALID])
+    analyst = Analyst(ProviderChain([claude, gpt], max_retries=0))
+
+    assert analyst.analyze(finding).provider == "openai"
+    assert claude.calls == 1
+
+
+def test_provider_exceptions_fail_over(finding: Finding) -> None:
+    analyst, _, _ = analyst_with([ProviderError("HTTP 529 overloaded")], [VALID])
+
+    assert analyst.analyze(finding).provider == "openai"
+
+
+def test_health_tracks_consecutive_failures(finding: Finding) -> None:
+    claude = ScriptedProvider("claude", ["garbage", "garbage", VALID])
+    gpt = ScriptedProvider("openai", [VALID])
+    chain = ProviderChain([claude, gpt], max_retries=1)
+    analyst = Analyst(chain)
+
+    analyst.analyze(finding)
+    assert chain.health["claude"].consecutive_failures == 2
+    assert chain.health["claude"].total_failures == 2
+    assert chain.health["openai"].consecutive_failures == 0
+    assert chain.health["openai"].last_success_at is not None
+
+    analyst.analyze(finding)  # claude now answers
+    assert chain.health["claude"].consecutive_failures == 0
+    assert chain.health["claude"].total_failures == 2
+
+
+def test_chain_logs_the_provider_used(finding: Finding, caplog: pytest.LogCaptureFixture) -> None:
+    analyst, _, _ = analyst_with(["garbage", "garbage"], [VALID])
+
+    with caplog.at_level(logging.INFO, logger="bellwether.analysis"):
+        analyst.analyze(finding)
+
+    served = [r for r in caplog.records if r.getMessage() == "analysis served"]
+    assert [getattr(r, "provider") for r in served] == ["openai"]
+    failed = [r for r in caplog.records if getattr(r, "provider", None) == "claude"]
+    assert len([r for r in failed if r.levelno == logging.WARNING]) >= 2
+
+
+def test_both_providers_receive_the_same_context(finding: Finding) -> None:
+    analyst, claude, gpt = analyst_with(["garbage"], [VALID])
+
+    analyst.analyze(finding)
+
+    assert claude.contexts[0] == gpt.contexts[0]
+
+
+def test_chain_requires_a_provider() -> None:
+    with pytest.raises(ValueError):
+        ProviderChain([], max_retries=1)
+
+
+def test_parse_json_object() -> None:
+    assert parse_json_object('{"a": 1}') == {"a": 1}
+    assert parse_json_object('```json\n{"a": 1}\n```') == {"a": 1}
+    with pytest.raises(InvalidResponse):
+        parse_json_object("[1, 2]")  # JSON, but not an object
+    with pytest.raises(InvalidResponse):
+        parse_json_object("")
+
+
+# --- Payload -> Proposal -----------------------------------------------------
+
+
+def test_executable_index_proposal_maps_args(finding: Finding) -> None:
+    analyst, _, _ = analyst_with([VALID_INDEX], [VALID])
+
+    proposal = analyst.analyze(finding)
+
+    assert proposal.action.kind is ActionKind.EXECUTABLE
+    assert proposal.action.executor_op == "create_small_index"
+    assert proposal.action.executor_args == VALID_INDEX["action"]["executor_args"]
+    assert proposal.action.command == VALID_INDEX["action"]["command"]
+
+
+def test_executable_kill_op_proposal_maps_args(finding: Finding) -> None:
+    analyst, _, _ = analyst_with([VALID_KILL_OP], [VALID])
+
+    proposal = analyst.analyze(finding)
+
+    assert proposal.action.executor_op == "kill_op"
+    assert proposal.action.executor_args == {"opid": 4242}
+
+
+# --- Schema file and model agree; schema fits structured outputs -------------
+
+
+def test_schema_file_matches_the_code() -> None:
+    assert json.loads(SCHEMA_FILE.read_text()) == PROPOSAL_SCHEMA
+
+
+def test_schema_is_valid_json_schema() -> None:
+    jsonschema.Draft202012Validator.check_schema(PROPOSAL_SCHEMA)
+
+
+def _objects(node: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        if node.get("type") == "object":
+            found.append(node)
+        for value in node.values():
+            found.extend(_objects(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_objects(value))
+    return found
+
+
+def test_schema_fits_structured_output_rules() -> None:
+    """Both providers constrain decoding with this schema: every object closed,
+    every property required (nullables via anyOf null), no numeric bounds."""
+    objects = _objects(PROPOSAL_SCHEMA)
+    assert objects
+    for obj in objects:
+        assert obj["additionalProperties"] is False
+        assert set(obj["required"]) == set(obj["properties"])
+    text = json.dumps(PROPOSAL_SCHEMA)
+    for keyword in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"):
+        assert f'"{keyword}"' not in text
+    wire = wire_schema()
+    assert "$schema" not in wire and "$id" not in wire and "title" not in wire
+
+
+@pytest.mark.parametrize("payload", [VALID, VALID_KILL_OP, VALID_INDEX])
+def test_valid_payloads_pass_schema_and_model(payload: dict[str, Any]) -> None:
+    jsonschema.validate(payload, PROPOSAL_SCHEMA)
+    assert isinstance(validate_payload(payload), ProposalPayload)
+
+
+STRUCTURAL = [
+    "missing diagnosis",
+    "extra top-level field",
+    "unknown action kind",
+    "reversible as string",
+    "op outside whitelist",
+    "opid as string",
+    "index direction 2",
+]
+
+
+@pytest.mark.parametrize("case", STRUCTURAL)
+def test_structural_violations_fail_schema_and_model(case: str) -> None:
+    payload = SCHEMA_VIOLATIONS[case]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(payload, PROPOSAL_SCHEMA)
+    with pytest.raises(ValueError):
+        validate_payload(payload)
+
+
+# --- Bounded context, prompt template ----------------------------------------
+
+
+def test_prompt_carries_finding_topology_and_remediations(finding: Finding) -> None:
+    analyst, claude, _ = analyst_with([VALID], [VALID])
+    analyst.analyze(finding)
+    context = claude.contexts[0]
+
+    prompt = render_prompt(finding, context)
+
+    assert finding.summary in prompt
+    assert "critical" in prompt
+    for evidence in finding.evidence:
+        assert evidence.render() in prompt
+    assert "node-backup (hidden)" in prompt
+    for hint in KNOWN_REMEDIATIONS["oplog_window_below_resync"]:
+        assert hint in prompt
+    # Bounded: no raw signal dumps or ids.
+    assert finding.signals[0].signal_id not in prompt
+
+
+def test_context_is_bounded(finding: Finding) -> None:
+    analyst, claude, _ = analyst_with([VALID], [VALID])
+    analyst.analyze(finding)
+
+    assert set(claude.contexts[0]) == {"topology", "remediations"}
+
+
+def test_unknown_failure_mode_still_renders(finding: Finding) -> None:
+    other = Finding(
+        signal_class=finding.signal_class,
+        failure_mode="something_new",
+        severity=Severity.WARNING,
+        node=TARGET,
+        summary="Something new.",
+        evidence=(),
+    )
+
+    prompt = render_prompt(other, {"topology": "", "remediations": []})
+
+    assert "Something new." in prompt
+
+
+def test_prompt_template_is_marked_for_design_review() -> None:
+    source = Path(analyst_module.__file__).read_text()
+
+    assert "# TODO(design): prompt wording set in design review" in source
+    assert isinstance(PROMPT_TEMPLATE, str) and PROMPT_TEMPLATE.strip()
+
+
+# --- Claude and OpenAI wrappers (SDK clients faked, no network) -------------
+
+
+class FakeCalls:
+    def __init__(self, reply: object) -> None:
+        self.reply = reply
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> object:
+        self.calls.append(kwargs)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
+def claude_reply(text: str, stop_reason: str = "end_turn") -> SimpleNamespace:
+    return SimpleNamespace(
+        content=[
+            SimpleNamespace(type="thinking", thinking=""),
+            SimpleNamespace(type="text", text=text),
+        ],
+        stop_reason=stop_reason,
+        usage=SimpleNamespace(input_tokens=1200, output_tokens=300),
+    )
+
+
+def openai_reply(
+    text: str | None, finish_reason: str = "stop", refusal: str | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason=finish_reason,
+                message=SimpleNamespace(content=text, refusal=refusal),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=1100, completion_tokens=280),
+    )
+
+
+def claude_with(reply: object) -> tuple[ClaudeProvider, FakeCalls]:
+    calls = FakeCalls(reply)
+    client = cast(anthropic.Anthropic, SimpleNamespace(messages=calls))
+    return ClaudeProvider(api_key="k", model="claude-opus-5", timeout_seconds=60, client=client), calls
+
+
+def openai_with(reply: object) -> tuple[OpenAIProvider, FakeCalls]:
+    calls = FakeCalls(reply)
+    client = cast(openai.OpenAI, SimpleNamespace(chat=SimpleNamespace(completions=calls)))
+    return OpenAIProvider(api_key="k", model="gpt-5", timeout_seconds=60, client=client), calls
+
+
+CONTEXT: dict[str, Any] = {"topology": "target node-backup", "remediations": ["grow the oplog"]}
+REQUEST = httpx2.Request("POST", "https://api.example.invalid/v1")
+
+
+def test_provider_names_match_config() -> None:
+    assert ClaudeProvider.name == "claude"
+    assert OpenAIProvider.name == "openai"
+
+
+def test_claude_requests_schema_constrained_json(finding: Finding) -> None:
+    provider, calls = claude_with(claude_reply(json.dumps(VALID)))
+
+    assert provider.analyze(finding, CONTEXT) == VALID
+
+    sent = calls.calls[0]
+    assert sent["model"] == "claude-opus-5"
+    assert sent["output_config"] == {"format": {"type": "json_schema", "schema": wire_schema()}}
+    assert sent["messages"] == [{"role": "user", "content": render_prompt(finding, CONTEXT)}]
+    assert sent["system"]
+
+
+def test_openai_requests_schema_constrained_json(finding: Finding) -> None:
+    provider, calls = openai_with(openai_reply(json.dumps(VALID)))
+
+    assert provider.analyze(finding, CONTEXT) == VALID
+
+    sent = calls.calls[0]
+    assert sent["model"] == "gpt-5"
+    assert sent["response_format"]["type"] == "json_schema"
+    assert sent["response_format"]["json_schema"]["strict"] is True
+    assert sent["response_format"]["json_schema"]["schema"] == wire_schema()
+    assert sent["messages"][-1] == {"role": "user", "content": render_prompt(finding, CONTEXT)}
+
+
+def test_providers_are_interchangeable(finding: Finding) -> None:
+    claude, claude_calls = claude_with(claude_reply(json.dumps(VALID)))
+    gpt, gpt_calls = openai_with(openai_reply(json.dumps(VALID)))
+
+    claude.analyze(finding, CONTEXT)
+    gpt.analyze(finding, CONTEXT)
+
+    claude_sent, gpt_sent = claude_calls.calls[0], gpt_calls.calls[0]
+    assert claude_sent["system"] == gpt_sent["messages"][0]["content"]
+    assert claude_sent["messages"][0]["content"] == gpt_sent["messages"][-1]["content"]
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        (claude_reply("I'd rather not.", stop_reason="refusal"), ProviderError),
+        (claude_reply('{"diagnosis": "trunc', stop_reason="max_tokens"), InvalidResponse),
+        (claude_reply("not json"), InvalidResponse),
+        (anthropic.APITimeoutError(request=REQUEST), ProviderError),
+        (anthropic.APIConnectionError(request=REQUEST), ProviderError),
+    ],
+)
+def test_claude_failures_become_provider_errors(
+    finding: Finding, reply: object, error: type[Exception]
+) -> None:
+    provider, _ = claude_with(reply)
+
+    with pytest.raises(error):
+        provider.analyze(finding, CONTEXT)
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        (openai_reply(None, refusal="I can't help with that."), ProviderError),
+        (openai_reply('{"diagnosis": "trunc', finish_reason="length"), InvalidResponse),
+        (openai_reply("not json"), InvalidResponse),
+        (openai.APITimeoutError(request=REQUEST), ProviderError),
+    ],
+)
+def test_openai_failures_become_provider_errors(
+    finding: Finding, reply: object, error: type[Exception]
+) -> None:
+    provider, _ = openai_with(reply)
+
+    with pytest.raises(error):
+        provider.analyze(finding, CONTEXT)
+
+
+def test_providers_log_token_usage(finding: Finding, caplog: pytest.LogCaptureFixture) -> None:
+    claude, _ = claude_with(claude_reply(json.dumps(VALID)))
+    gpt, _ = openai_with(openai_reply(json.dumps(VALID)))
+
+    with caplog.at_level(logging.INFO, logger="bellwether.analysis"):
+        claude.analyze(finding, CONTEXT)
+        gpt.analyze(finding, CONTEXT)
+
+    usage = {
+        getattr(r, "provider"): (getattr(r, "input_tokens"), getattr(r, "output_tokens"))
+        for r in caplog.records
+        if r.getMessage() == "provider response"
+    }
+    assert usage == {"claude": (1200, 300), "openai": (1100, 280)}
+
+
+def test_sdk_clients_leave_retries_to_the_chain() -> None:
+    claude = ClaudeProvider(api_key="k", model="claude-opus-5", timeout_seconds=12)
+    gpt = OpenAIProvider(api_key="k", model="gpt-5", timeout_seconds=12)
+
+    assert claude._client.max_retries == 0
+    assert gpt._client.max_retries == 0
+    assert claude._client.timeout == 12
+    assert gpt._client.timeout == 12

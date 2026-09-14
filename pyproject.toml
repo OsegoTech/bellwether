@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Predictive reliability service for self-hosted MongoDB replica sets"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=0.60",
+    "openai>=1.60",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pymongo>=4.9",
@@ -12,8 +14,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "jsonschema>=4.26.0",
     "mypy>=1.10",
     "pytest>=8.0",
+    "types-jsonschema>=4.26.0.20260518",
     "types-PyYAML>=6.0",
 ]
 

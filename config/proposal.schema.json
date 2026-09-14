@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bellwether proposal",
+  "description": "A diagnosis of one finding and one remediation for a human to approve.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "diagnosis",
+    "mechanism",
+    "impact_if_ignored",
+    "action",
+    "confidence"
+  ],
+  "properties": {
+    "diagnosis": {
+      "type": "string",
+      "description": "What is happening and why."
+    },
+    "mechanism": {
+      "type": "string",
+      "description": "The MongoDB internal that explains it."
+    },
+    "impact_if_ignored": {
+      "type": "string",
+      "description": "What happens if nothing changes."
+    },
+    "action": {
+      "$ref": "#/$defs/action"
+    },
+    "confidence": {
+      "type": "number",
+      "description": "Confidence in the diagnosis, 0.0 to 1.0."
+    }
+  },
+  "$defs": {
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "title",
+        "command",
+        "rationale",
+        "reversible",
+        "executor_op",
+        "executor_args"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "propose_only",
+            "executable"
+          ],
+          "description": "propose_only: a human runs `command` by hand. executable: only kill_op or create_small_index, run after human approval."
+        },
+        "title": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string",
+          "description": "Human-runnable form; audit record."
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "reversible": {
+          "type": "boolean"
+        },
+        "executor_op": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "kill_op",
+                "create_small_index"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "executor_args": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/kill_op_args"
+            },
+            {
+              "$ref": "#/$defs/create_small_index_args"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "kill_op_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "opid"
+      ],
+      "properties": {
+        "opid": {
+          "type": "integer"
+        }
+      }
+    },
+    "create_small_index_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "db",
+        "collection",
+        "keys",
+        "estimated_docs"
+      ],
+      "properties": {
+        "db": {
+          "type": "string"
+        },
+        "collection": {
+          "type": "string"
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/index_key"
+          }
+        },
+        "estimated_docs": {
+          "type": "integer"
+        }
+      }
+    },
+    "index_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "direction"
+      ],
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "integer",
+          "enum": [
+            1,
+            -1
+          ]
+        }
+      }
+    }
+  }
+}
