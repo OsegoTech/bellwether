@@ -25,6 +25,10 @@ coarser: MongoDB distinguishes ``$gt`` from ``$lt``, ``$in`` list lengths,
 projection and collation; here they share a class. Aggregations take their
 consecutive leading ``$match`` stages as one filter — the same approximation
 MongoDB documents for its pipeline shapes.
+
+The **candidate index** for a shape is built by MongoDB's documented ESR rule
+(equality, sort, range) — the field order is computed here, never chosen by a
+model. See ``build_candidate``.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from bson.regex import Regex
 
@@ -201,6 +205,93 @@ def group_by_shape(records: Iterable[Mapping[str, Any]]) -> dict[str, list[Mappi
     for record in records:
         groups.setdefault(shape_of(record).key, []).append(record)
     return groups
+
+
+# MongoDB's compound-index limit; Performance Advisor never suggests more.
+MAX_INDEX_FIELDS = 16
+
+# Predicates an index can bound but not pin to one value: placed with range.
+RANGE_LIKE = (RANGE, REGEX, NEGATION, EXISTS)
+
+
+class IndexKey(NamedTuple):
+    field: str
+    direction: int
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """An ESR candidate index. ``keys`` is the index; the segments show why."""
+
+    keys: tuple[IndexKey, ...]
+    equality: tuple[str, ...]
+    sort: tuple[IndexKey, ...]
+    range: tuple[str, ...]
+    dropped: tuple[str, ...]  # fields cut by the 16-field cap, lowest value first
+
+    def as_evidence(self) -> list[dict[str, Any]]:
+        """The keys in the executor's and schema's ``{field, direction}`` form."""
+        return [{"field": k.field, "direction": k.direction} for k in self.keys]
+
+
+def build_candidate(shape: QueryShape, frequency: Mapping[str, int] | None = None) -> Candidate:
+    """The candidate index for `shape`, by the ESR rule.
+
+    1. **Equality** fields first. MongoDB refines their order by cardinality,
+       which the profiler cannot show; it is approximated by `frequency` — how
+       many shapes on the collection use the field for equality, most first, so
+       the prefix serves the most queries — then by name as a stable tie-break.
+    2. **Sort** fields next, in sort order and direction.
+    3. **Range** fields last (range, regex, negation, exists), ordered like
+       equality. ``or`` and ``other`` predicates are left out: a compound index
+       cannot serve them from its prefix.
+
+    No field appears twice: a field that is both equality and sort keeps the
+    equality position; one that is both range and sort takes the sort position
+    (one entry bounds the range and serves the sort). Fields past 16 are cut —
+    they are the last in ESR order, the lowest value — and listed in
+    ``dropped``.
+    """
+    counts = frequency or {}
+
+    def rank(field: str) -> tuple[int, str]:
+        return (-counts.get(field, 0), field)
+
+    equality = sorted(shape.fields(EQ), key=rank)
+    placed = set(equality)
+    sort: list[IndexKey] = []
+    for field, direction in shape.sort:
+        if field not in placed:
+            sort.append(IndexKey(field, direction))
+            placed.add(field)
+    range_ = sorted((f for f in shape.fields(*RANGE_LIKE) if f not in placed), key=rank)
+
+    ordered = [*(IndexKey(f, 1) for f in equality), *sort, *(IndexKey(f, 1) for f in range_)]
+    kept = tuple(ordered[:MAX_INDEX_FIELDS])
+    kept_fields = {k.field for k in kept}
+    return Candidate(
+        keys=kept,
+        equality=tuple(f for f in equality if f in kept_fields),
+        sort=tuple(k for k in sort if k.field in kept_fields),
+        range=tuple(f for f in range_ if f in kept_fields),
+        dropped=tuple(k.field for k in ordered[MAX_INDEX_FIELDS:]),
+    )
+
+
+def candidate_index(
+    shape: QueryShape, frequency: Mapping[str, int] | None = None
+) -> tuple[IndexKey, ...]:
+    """The ESR candidate index keys for `shape` (see build_candidate)."""
+    return build_candidate(shape, frequency).keys
+
+
+def equality_frequency(shapes: Iterable[QueryShape]) -> dict[str, int]:
+    """For each field, how many of `shapes` use it as an equality predicate."""
+    counts: dict[str, int] = {}
+    for shape in shapes:
+        for field in shape.fields(EQ):
+            counts[field] = counts.get(field, 0) + 1
+    return counts
 
 
 def iso(value: Any) -> str | None:
