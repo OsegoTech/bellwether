@@ -57,14 +57,16 @@ notify:
 approval:
   # Slack user IDs (U…/W…, not display names) allowed to Approve or Reject from
   # Slack. A verified click from anyone else is refused (403), changes nothing,
-  # and is recorded as an audit event. Empty = nobody: `bellwether serve`
-  # refuses to start until this is set.
+  # and is recorded as an audit event. Required whenever an approval path is
+  # enabled (slack in notify.channels, or the loopback decision endpoint below);
+  # with neither, `bellwether serve` runs a read-only API and this may be empty.
   # Env: BELLWETHER_APPROVAL__APPROVER_IDS='["U0123ABCD"]'
   approver_ids: []
   # POST /api/proposals/{id}/decision. Works only when this is true AND
-  # `bellwether serve` is bound to a loopback host (reach it over an SSH tunnel
-  # or a local proxy); on a public bind it is refused (403). Slack approval is
-  # unaffected. The same approver_ids apply.
+  # `bellwether serve` is bound to a loopback host AND the request comes from a
+  # loopback address (reach it over an SSH tunnel); otherwise it is refused
+  # (403). Slack approval is unaffected. The same approver_ids apply. Set false
+  # (with slack off) for a read-only API.
   ui_approval_enabled: true
 
 store:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import logging
+from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -170,17 +171,21 @@ def client_for(
     bind: str | None = "127.0.0.1",
     enabled: bool = True,
     executor: FakeExecutor | None = None,
+    caller: str = "127.0.0.1",
+    secret: str | None = SECRET,
+    approvers: Collection[str] = APPROVERS,
 ) -> TestClient:
     return TestClient(
         create_app(
             store,
-            signing_secret=SECRET,
-            approver_ids=APPROVERS,
+            signing_secret=secret,
+            approver_ids=approvers,
             executor=executor,
             clock=NOW.timestamp,
             bind_host=bind,
             ui_approval_enabled=enabled,
-        )
+        ),
+        client=(caller, 50000),
     )
 
 
@@ -479,7 +484,7 @@ def test_reject_needs_no_acknowledgement(store: SqliteStore) -> None:
     assert executor.calls == []
 
 
-@pytest.mark.parametrize("bind", ["0.0.0.0", "10.0.0.5", "::", None])
+@pytest.mark.parametrize("bind", ["0.0.0.0", "192.0.2.5", "::", None])
 def test_decision_is_refused_unless_bound_to_loopback(
     store: SqliteStore, bind: str | None, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -500,6 +505,101 @@ def test_decision_is_refused_when_disabled(store: SqliteStore) -> None:
 
     json_error(decide(client_for(store, enabled=False), pending.proposal_id), 403, "approval_not_permitted")
     assert store.current_state(pending.proposal_id).state is ApprovalState.PENDING
+
+
+# --- the caller's own address must be loopback too (defense in depth) ----------------------------
+
+
+@pytest.mark.parametrize(
+    "caller", ["203.0.113.7", "192.0.2.50", "::ffff:192.0.2.1", "2001:db8::1", "testclient"]
+)
+def test_a_non_loopback_caller_is_refused_even_on_a_loopback_bound_server(
+    store: SqliteStore, caller: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    pending = seed(store)["pending"]
+    executor = FakeExecutor(store)
+
+    with caplog.at_level(logging.WARNING, logger="bellwether.app"):
+        response = decide(client_for(store, executor=executor, caller=caller), pending.proposal_id)
+
+    body = json_error(response, 403, "approval_not_permitted")
+    assert "loopback" in body["detail"]
+    assert store.current_state(pending.proposal_id).state is ApprovalState.PENDING
+    assert executor.calls == []
+    assert any("caller" in r.getMessage() for r in caplog.records)
+
+
+def test_forwarding_headers_cannot_make_a_remote_caller_local(store: SqliteStore) -> None:
+    pending = seed(store)["pending"]
+    client = client_for(store, caller="203.0.113.7")
+
+    response = client.post(
+        f"/api/proposals/{pending.proposal_id}/decision",
+        json={"decision": "approve", "approver_id": "U0OSEGO", "acknowledged": True},
+        headers={"X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1", "Forwarded": "for=127.0.0.1"},
+    )
+
+    json_error(response, 403, "approval_not_permitted")
+    assert store.current_state(pending.proposal_id).state is ApprovalState.PENDING
+
+
+@pytest.mark.parametrize("caller", ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"])
+def test_a_loopback_caller_on_a_loopback_bound_server_succeeds(
+    store: SqliteStore, caller: str
+) -> None:
+    pending = seed(store)["pending"]
+    executor = FakeExecutor(store)
+
+    response = decide(client_for(store, executor=executor, caller=caller), pending.proposal_id)
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "approved"
+    assert len(executor.calls) == 1
+
+
+# --- without Slack: API-only, and read-only when no approval path exists ----------------------
+
+
+def test_without_slack_the_decision_endpoint_needs_no_slack_secret(store: SqliteStore) -> None:
+    pending = seed(store)["pending"]
+    client = client_for(store, secret=None, executor=FakeExecutor(store))
+
+    assert client.post("/slack/actions", content=b"payload=x").status_code == 404  # not mounted
+    assert decide(client, pending.proposal_id).status_code == 200
+
+
+@pytest.mark.parametrize(("bind", "enabled"), [("127.0.0.1", False), ("0.0.0.0", True), (None, True)])
+def test_with_no_approval_path_the_api_is_read_only(
+    store: SqliteStore, bind: str | None, enabled: bool
+) -> None:
+    pending = seed(store)["pending"]
+    client = client_for(store, bind=bind, enabled=enabled, secret=None, approvers=())
+
+    assert client.get("/api/proposals").status_code == 200
+    assert client.post("/slack/actions", content=b"payload=x").status_code == 404
+    body = json_error(decide(client, pending.proposal_id), 403, "no_approval_path")
+    assert "no approval path is configured" in body["detail"]
+    assert store.current_state(pending.proposal_id).state is ApprovalState.PENDING
+    assert store.list_audit_events(pending.proposal_id) == []
+
+
+def test_an_allowlist_is_required_when_the_decision_endpoint_is_reachable(store: SqliteStore) -> None:
+    with pytest.raises(ValueError, match="approver_ids"):
+        create_app(store, approver_ids=(), bind_host="127.0.0.1", ui_approval_enabled=True)
+
+
+def test_slack_routes_still_require_the_secret_when_slack_is_enabled(store: SqliteStore) -> None:
+    client = client_for(store)  # a signing secret: Slack is enabled
+
+    unsigned = client.post(
+        "/slack/actions",
+        content=b"payload=%7B%7D",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert unsigned.status_code == 401
+    with pytest.raises(ValueError, match="signing secret"):
+        create_app(store, signing_secret="", approver_ids=APPROVERS)
 
 
 def test_a_non_allowlisted_approver_is_refused_and_audited(store: SqliteStore) -> None:

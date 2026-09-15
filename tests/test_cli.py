@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from bellwether import cli, pipeline
 from bellwether.analysis.analyst import Analyst
@@ -336,20 +337,101 @@ def test_approve_unknown_proposal(config_path: Path, capsys: pytest.CaptureFixtu
 # --- serve ----------------------------------------------------------------------------------
 
 
-def test_serve_requires_the_signing_secret(
+def capture_uvicorn(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    started: dict[str, Any] = {}
+
+    def fake_run(app: FastAPI, **kwargs: Any) -> None:
+        started["app"] = app
+        started.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    return started
+
+
+def slack_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("BELLWETHER_NOTIFY__SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T0/B0/x")
+    return write_config(tmp_path, notify={"channels": ["stdout", "slack"]})
+
+
+def test_serve_starts_without_slack_when_slack_is_not_a_channel(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No Slack secret anywhere; the fixture's notify.channels is [stdout].
+    monkeypatch.setenv("BELLWETHER_APPROVAL__APPROVER_IDS", '["U0OSEGO"]')
+    started = capture_uvicorn(monkeypatch)
+
+    assert cli.main(["--config", str(config_path), "serve"]) == 0
+    app = started["app"]
+    assert app.state.slack_enabled is False
+    assert app.state.approval_paths == ("api",)
+    assert "/slack/actions" not in {getattr(route, "path", None) for route in app.routes}
+
+
+def test_serve_runs_a_read_only_api_when_no_approval_path_is_enabled(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No Slack, decision endpoint off, no allowlist: still starts.
+    monkeypatch.setenv("BELLWETHER_APPROVAL__UI_APPROVAL_ENABLED", "false")
+    started = capture_uvicorn(monkeypatch)
+
+    assert cli.main(["--config", str(config_path), "serve"]) == 0
+    client = TestClient(started["app"], client=("127.0.0.1", 50000))
+    assert client.get("/api/proposals").json() == []
+    response = client.post(
+        f"/api/proposals/{'0' * 32}/decision", json={"decision": "reject", "approver_id": "U0OSEGO"}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"] == "no_approval_path"
+
+
+def test_serve_requires_an_allowlist_when_the_decision_endpoint_is_reachable(
     config_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert cli.main(["--config", str(config_path), "serve"]) == 2
+    err = capsys.readouterr().err
+    assert "BELLWETHER_APPROVAL__APPROVER_IDS" in err
+    assert "decision endpoint" in err
+
+
+def test_serve_with_slack_requires_the_signing_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BELLWETHER_APPROVAL__APPROVER_IDS", '["U0OSEGO"]')
+    path = slack_config(tmp_path, monkeypatch)
+
+    assert cli.main(["--config", str(path), "serve"]) == 2
     assert "BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET" in capsys.readouterr().err
 
 
-def test_serve_requires_an_approver_allowlist(
-    config_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_serve_with_slack_requires_an_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET", "s3cret")
+    path = slack_config(tmp_path, monkeypatch)
 
-    assert cli.main(["--config", str(config_path), "serve"]) == 2
-    assert "BELLWETHER_APPROVAL__APPROVER_IDS" in capsys.readouterr().err
+    # Public bind: the decision endpoint is off, so Slack is the only approval path.
+    assert cli.main(["--config", str(path), "serve", "--host", "0.0.0.0"]) == 2
+    err = capsys.readouterr().err
+    assert "BELLWETHER_APPROVAL__APPROVER_IDS" in err
+    assert "Slack" in err
+
+
+def test_serve_with_slack_mounts_the_signed_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET", "s3cret")
+    monkeypatch.setenv("BELLWETHER_APPROVAL__APPROVER_IDS", '["U0OSEGO"]')
+    started = capture_uvicorn(monkeypatch)
+    path = slack_config(tmp_path, monkeypatch)
+
+    assert cli.main(["--config", str(path), "serve"]) == 0
+    assert started["app"].state.slack_enabled is True
+    unsigned = TestClient(started["app"]).post(
+        "/slack/actions",
+        content=b"payload=%7B%7D",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert unsigned.status_code == 401
 
 
 def test_serve_starts_uvicorn_on_localhost(
@@ -370,6 +452,7 @@ def test_serve_starts_uvicorn_on_localhost(
     assert started["host"] == "127.0.0.1"
     assert started["port"] == 8099
     assert started["app"].state.ui_approval_permitted is True  # loopback-bound
+    assert started["proxy_headers"] is False  # X-Forwarded-For never rewrites the caller
 
 
 def test_serve_on_a_public_interface_disables_in_ui_approval(

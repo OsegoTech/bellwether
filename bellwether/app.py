@@ -9,15 +9,19 @@ pipeline runs.
 
 **Two write paths, each independently gated, both audited.**
 
-1. ``POST /slack/actions`` — Slack interactive callbacks. Gated by the Slack
-   signature (Slack's v0 scheme: HMAC-SHA256 over ``v0:<ts>:<raw body>`` with
-   the signing secret, a constant-time compare, a five-minute replay window;
-   anything that fails is a 401 and changes nothing) and then by
-   ``approval.approver_ids``.
+1. ``POST /slack/actions`` — Slack interactive callbacks, present only when
+   Slack is used. Gated by the Slack signature (Slack's v0 scheme: HMAC-SHA256
+   over ``v0:<ts>:<raw body>`` with the signing secret, a constant-time compare,
+   a five-minute replay window; anything that fails is a 401 and changes
+   nothing) and then by ``approval.approver_ids``.
 2. ``POST /api/proposals/{id}/decision`` — the JSON decision endpoint. Gated by
    the bind address (403 unless ``approval.ui_approval_enabled`` is true AND
-   the server is bound to a loopback host) and then by the same
-   ``approval.approver_ids``.
+   the server is bound to a loopback host), then by the caller's own address
+   (403 unless it is loopback; X-Forwarded-For is not trusted), and then by the
+   same ``approval.approver_ids``.
+
+With neither path configured the API is read-only, and the allowlist is not
+required.
 
 Why loopback: the decision endpoint is for callers inside the trust boundary —
 an operator on the host, or a frontend proxied through it — never the public
@@ -90,22 +94,33 @@ audit store holds.
 * `POST /slack/actions` — Slack interactive callbacks, verified by Slack's request
   signature, then checked against the approver allowlist.
 * `POST /api/proposals/{proposal_id}/decision` — for callers inside the trust
-  boundary. It only works when the server is bound to a **loopback** address
-  (reach it over an SSH tunnel or a local proxy) and `approval.ui_approval_enabled`
-  is true, and the approver must be on the allowlist.
+  boundary. It only works when the server is bound to a **loopback** address, the
+  request itself comes from a loopback address (reach it over an SSH tunnel), and
+  `approval.ui_approval_enabled` is true; the approver must be on the allowlist.
+
+With neither path configured, the API is read-only.
 """
 
 DECISION_DESCRIPTION = """\
 Approve or reject a pending proposal.
 
-**Gates, in order.** Refused with `403 approval_not_permitted` unless the server is
-bound to a **loopback** host (127.0.0.1, ::1, localhost) and
-`approval.ui_approval_enabled` is true — this endpoint is for callers inside the
-trust boundary (an operator on the host, or a frontend proxied through it); the
-public approval path is Slack, which is signature-verified. Then the `approver_id`
-must be on the **allowlist** `approval.approver_ids`; otherwise `403
-not_authorized`, nothing changes, and an `unauthorized_decision` audit event is
-recorded.
+**Gates, in order.**
+
+1. `403 no_approval_path` if no approval path is configured at all (Slack not
+   enabled, and this endpoint not enabled): the server is a read-only API.
+2. `403 approval_not_permitted` unless the server is bound to a **loopback** host
+   (127.0.0.1, ::1, localhost) and `approval.ui_approval_enabled` is true. This
+   endpoint is for callers inside the trust boundary; the public approval path is
+   Slack, which is signature-verified.
+3. `403 approval_not_permitted` unless the **caller's** address is loopback too
+   (127.0.0.0/8, ::1). This is defense in depth, independent of the bind check.
+   `X-Forwarded-For` is **not** trusted for it. A reverse proxy on the same host
+   that forwards to this port still presents a loopback caller, so the check
+   reduces that exposure but does not remove it: the real control is not
+   exposing this port.
+4. The `approver_id` must be on the **allowlist** `approval.approver_ids`;
+   otherwise `403 not_authorized`, nothing changes, and an
+   `unauthorized_decision` audit event is recorded.
 
 **Effect.** The proposal's state is re-read from the store: only a `pending`
 proposal moves (`409 already_decided` otherwise). Approving an `executable`
@@ -180,24 +195,55 @@ def is_loopback_host(host: str | None) -> bool:
         return False
 
 
+def is_loopback_address(host: str | None) -> bool:
+    """Whether a caller's address is loopback (127.0.0.0/8, ::1, or IPv4-mapped 127.x).
+
+    IP literals only: a name is not an address, so it fails closed. This is the
+    TCP peer address; X-Forwarded-For is never consulted.
+    """
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback
+
+
 def create_app(
     store: SqliteStore,
     *,
-    signing_secret: str,
-    approver_ids: Collection[str],
+    signing_secret: str | None = None,
+    approver_ids: Collection[str] = (),
     executor: SupportsExecute | None = None,
     clock: Callable[[], float] = time.time,
     bind_host: str | None = None,
     ui_approval_enabled: bool = True,
 ) -> FastAPI:
-    if not signing_secret:
-        raise ValueError("a Slack signing secret is required")
-    if not approver_ids:
-        raise ValueError("an approver allowlist (approval.approver_ids) is required; it is empty")
-    approvers = frozenset(approver_ids)
+    """Build the API.
+
+    ``signing_secret`` enables the Slack callback; None means Slack is not used
+    and ``/slack/actions`` does not exist. The approver allowlist is required
+    whenever an approval path is reachable (Slack, or the loopback decision
+    endpoint). With neither, the API is read-only.
+    """
+    if signing_secret is not None and not signing_secret:
+        raise ValueError("the Slack signing secret is empty; pass None when Slack is not used")
+    slack_enabled = signing_secret is not None
     # The decision endpoint needs both: the operator's switch, and a loopback-only
     # bind. An unknown bind address (None) fails closed.
     decisions_permitted = ui_approval_enabled and is_loopback_host(bind_host)
+    approval_paths = tuple(
+        name for name, on in (("slack", slack_enabled), ("api", decisions_permitted)) if on
+    )
+    if approval_paths and not approver_ids:
+        raise ValueError(
+            "an approver allowlist (approval.approver_ids) is required when an approval path "
+            f"is enabled ({', '.join(approval_paths)}); it is empty"
+        )
+    approvers = frozenset(approver_ids)
 
     version = _package_version()
     app = FastAPI(
@@ -211,6 +257,8 @@ def create_app(
     )
     app.state.bind_host = bind_host
     app.state.ui_approval_permitted = decisions_permitted
+    app.state.slack_enabled = slack_enabled
+    app.state.approval_paths = approval_paths
 
     def openapi() -> dict[str, Any]:
         # The decision body is parsed by hand (to answer malformed input with a
@@ -319,29 +367,32 @@ def create_app(
     ) -> list[RunOut]:
         return [RunOut.of(run) for run in list(reversed(store.list_runs()))[:limit]]
 
-    # --- write path 1: Slack ---------------------------------------------------------------
+    # --- write path 1: Slack (only when Slack is used) -------------------------------------
 
-    @app.post("/slack/actions", tags=["slack"], summary="Slack interactive callback")
-    async def slack_actions(request: Request, background: BackgroundTasks) -> JSONResponse:
-        body = await request.body()
-        if not verify_slack_signature(
-            signing_secret,
-            body,
-            request.headers.get("X-Slack-Request-Timestamp"),
-            request.headers.get("X-Slack-Signature"),
-            clock(),
-        ):
-            logger.warning(
-                "slack callback rejected: bad signature",
-                extra={"client": request.client.host if request.client else None},
-            )
-            raise HTTPException(status_code=401, detail="invalid Slack signature")
-        decision = _parse_slack_decision(body)
-        if decision.user_id not in approvers:
-            outcome = await run_in_threadpool(_refuse, store, decision)
-        else:
-            outcome = await run_in_threadpool(_decide, store, executor, decision, background)
-        return _slack_response(outcome)
+    if signing_secret is not None:
+        slack_secret = signing_secret
+
+        @app.post("/slack/actions", tags=["slack"], summary="Slack interactive callback")
+        async def slack_actions(request: Request, background: BackgroundTasks) -> JSONResponse:
+            body = await request.body()
+            if not verify_slack_signature(
+                slack_secret,
+                body,
+                request.headers.get("X-Slack-Request-Timestamp"),
+                request.headers.get("X-Slack-Signature"),
+                clock(),
+            ):
+                logger.warning(
+                    "slack callback rejected: bad signature",
+                    extra={"client": request.client.host if request.client else None},
+                )
+                raise HTTPException(status_code=401, detail="invalid Slack signature")
+            decision = _parse_slack_decision(body)
+            if decision.user_id not in approvers:
+                outcome = await run_in_threadpool(_refuse, store, decision)
+            else:
+                outcome = await run_in_threadpool(_decide, store, executor, decision, background)
+            return _slack_response(outcome)
 
     # --- write path 2: the JSON decision endpoint (loopback only) ---------------------------
 
@@ -353,7 +404,11 @@ def create_app(
         description=DECISION_DESCRIPTION,
         responses={
             400: {"model": ErrorOut, "description": "Malformed body, or approve without acknowledgement."},
-            403: {"model": ErrorOut, "description": "Not a loopback-bound server, or approver not on the allowlist."},
+            403: {
+                "model": ErrorOut,
+                "description": "No approval path configured, not a loopback-bound server, a "
+                "non-loopback caller, or an approver not on the allowlist.",
+            },
             404: {"model": ErrorOut, "description": "No such proposal."},
             409: {"model": ErrorOut, "description": "The proposal is no longer pending."},
         },
@@ -367,6 +422,19 @@ def create_app(
         },
     )
     async def decide_proposal(proposal_id: str, request: Request, background: BackgroundTasks) -> Any:
+        caller = request.client.host if request.client else None
+        if not approval_paths:
+            logger.warning(
+                "API decision refused: no approval path is configured (read-only API)",
+                extra={"proposal_id": proposal_id, "client": caller},
+            )
+            return _error(
+                403,
+                "no_approval_path",
+                "no approval path is configured: Slack is not enabled, and this endpoint needs "
+                "a loopback-bound server with approval.ui_approval_enabled and an approver "
+                "allowlist; this server is read-only",
+            )
         if not decisions_permitted:
             # A publicly bound server must not accept decisions here: this path
             # authenticates by host access, which only holds on loopback.
@@ -378,17 +446,27 @@ def create_app(
             logger.warning(
                 "API decision refused: approval requires a loopback-bound server with "
                 "ui_approval_enabled",
-                extra={
-                    "proposal_id": proposal_id,
-                    "reason": reason,
-                    "client": request.client.host if request.client else None,
-                },
+                extra={"proposal_id": proposal_id, "reason": reason, "client": caller},
             )
             return _error(
                 403,
                 "approval_not_permitted",
                 "decisions over the API require a loopback-bound server with "
                 "approval.ui_approval_enabled; approve or reject from Slack instead",
+            )
+        if not is_loopback_address(caller):
+            # Defense in depth, independent of the bind check: the TCP peer must be
+            # loopback too. X-Forwarded-For is never trusted here (serve runs uvicorn
+            # with proxy_headers off), so a remote caller cannot claim to be local.
+            logger.warning(
+                "API decision refused: the caller is not a loopback address",
+                extra={"proposal_id": proposal_id, "client": caller},
+            )
+            return _error(
+                403,
+                "approval_not_permitted",
+                "decisions over the API must come from a loopback address; this request came "
+                f"from {caller or 'an unknown address'}",
             )
         try:
             data = json.loads(await request.body())

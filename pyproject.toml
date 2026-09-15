@@ -40,6 +40,7 @@ testpaths = ["tests"]
 
 [tool.mypy]
 strict = true
+python_version = "3.11"  # the declared minimum (requires-python)
 plugins = ["pydantic.mypy"]
 
 [tool.pydantic-mypy]

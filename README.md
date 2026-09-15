@@ -83,8 +83,10 @@ human decides, and why the proposal carries the evidence it rests on.
   Claude-only.
 - **Slack**, optional, for notifications and one-click approval: an incoming
   webhook plus an app with interactivity pointed at `/slack/actions`.
-  `bellwether serve` currently requires the Slack signing secret and at least
-  one approver id even if you only use the API.
+  The Slack secrets are needed only when `slack` is in `notify.channels`. The
+  approver allowlist is needed only when an approval path is enabled (Slack,
+  or the loopback decision endpoint). With neither, `bellwether serve` runs a
+  read-only API.
 - **Prometheus**, optional. The config section exists, but no detector reads
   it today.
 
@@ -248,7 +250,7 @@ it. Precedence is YAML, then `.env`, then environment variables
 BELLWETHER_ANALYSIS__ANTHROPIC_API_KEY=...
 BELLWETHER_ANALYSIS__OPENAI_API_KEY=...          # if openai is a provider
 BELLWETHER_NOTIFY__SLACK_WEBHOOK_URL=...         # if slack is a channel
-BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET=...      # if slack is a channel; required by serve
+BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET=...      # if slack is a channel
 BELLWETHER_MONGO__TLS_CERT_PASSPHRASE=...        # only if the key is encrypted
 BELLWETHER_EXECUTOR__TLS_CERT_PASSPHRASE=...
 ```
@@ -333,9 +335,10 @@ bellwether serve --host 127.0.0.1 --port 8080
 loopback and reach it over an SSH tunnel
 (`ssh -L 8080:127.0.0.1:8080 monitoring-host`).
 
-For Slack's callback, put a TLS reverse proxy in front that forwards **only**
-`POST /slack/actions`. The decision endpoint's gate is the server's bind
-address, not the client's. A proxy that forwards everything would expose it.
+`/slack/actions` exists only when `slack` is in `notify.channels`. For Slack's
+callback, put a TLS reverse proxy in front that forwards **only**
+`POST /slack/actions`. Never forward the decision endpoint (see
+[Security](#security-of-the-decision-endpoint) below).
 
 Also on the command line: `bellwether list [--pending]`,
 `bellwether show <id>`, and `bellwether approve <id> --by NAME`.
@@ -351,8 +354,8 @@ and one of the codes below:
 ```
 
 The codes are `malformed_request` (400), `acknowledgement_required` (400),
-`approval_not_permitted` (403), `not_authorized` (403), `not_found` (404) and
-`already_decided` (409).
+`no_approval_path` (403), `approval_not_permitted` (403), `not_authorized`
+(403), `not_found` (404) and `already_decided` (409).
 
 | Method | Path | What it returns |
 |---|---|---|
@@ -363,7 +366,7 @@ The codes are `malformed_request` (400), `acknowledgement_required` (400),
 | `GET` | `/api/findings?run_id=&limit=50` | Findings, including INFO findings that were only noted |
 | `GET` | `/api/runs?limit=50` | Pipeline runs with counts and errors |
 | `POST` | `/api/proposals/{id}/decision` | Approve or reject (loopback only, see below) |
-| `POST` | `/slack/actions` | Slack interactive callback (signature-verified) |
+| `POST` | `/slack/actions` | Slack interactive callback (signature-verified; only when Slack is enabled) |
 
 List pending proposals:
 
@@ -379,18 +382,40 @@ curl -s -X POST http://127.0.0.1:8080/api/proposals/<proposal_id>/decision \
   -d '{"decision": "approve", "approver_id": "U0123ABCD", "acknowledged": true}'
 ```
 
-The decision endpoint returns 403 unless the server is bound to a loopback
-address and `approval.ui_approval_enabled` is true. The `approver_id` must be
-in `approval.approver_ids`. An id outside the list is refused, changes
-nothing, and is recorded as an `unauthorized_decision` audit event.
+The decision endpoint returns 403 unless all of these hold:
+- an approval path is configured (`no_approval_path` otherwise: the server is
+  read-only);
+- the server is bound to a loopback address;
+- `approval.ui_approval_enabled` is true;
+- the request itself comes from a loopback address.
+
+The `approver_id` must be in `approval.approver_ids`. An id outside the list is
+refused, changes nothing, and is recorded as an `unauthorized_decision` audit
+event.
 
 Approving requires `"acknowledged": true`. Only a `pending` proposal moves.
 An approved executable proposal goes to the executor through the same code
 path as a Slack approval. Read the proposal back to see `executed` or
 `failed`.
 
+### Security of the decision endpoint
+
 The API has no authentication of its own: on loopback, host access *is* the
-authentication. Do not expose it publicly.
+authentication. Two independent checks protect the decision endpoint:
+
+1. **The server's bind address** must be loopback.
+2. **The caller's address** must be loopback (127.0.0.0/8, `::1`).
+
+The second check is defense in depth. It reads the TCP peer address only.
+`X-Forwarded-For` is **not** trusted for this check, and `bellwether serve`
+runs uvicorn with proxy headers off, so no header can make a remote caller
+look local.
+
+The residual risk is real, and it is the operator's. A reverse proxy on the
+same host that forwards to the loopback port connects *from* loopback, so its
+requests pass the caller check. The check reduces this exposure but does not
+eliminate it. The real control is not exposing this port: forward only
+`POST /slack/actions`, and reach everything else over an SSH tunnel.
 
 ## 9. What it is NOT
 

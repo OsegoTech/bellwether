@@ -291,6 +291,7 @@ class DecisionResponse(_Schema):
 class ErrorOut(_Schema):
     error: str = Field(
         description="Machine-readable code: `malformed_request`, `acknowledgement_required`, "
-        "`approval_not_permitted`, `not_authorized`, `not_found`, `already_decided`."
+        "`no_approval_path`, `approval_not_permitted`, `not_authorized`, `not_found`, "
+        "`already_decided`."
     )
     detail: str = Field(description="Human-readable explanation.")

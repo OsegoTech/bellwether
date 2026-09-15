@@ -23,7 +23,7 @@ from collections.abc import Callable, Sequence
 import uvicorn
 
 from bellwether import pipeline
-from bellwether.app import create_app
+from bellwether.app import create_app, is_loopback_host
 from bellwether.config import BellwetherConfig, ConfigError, env_var_for, load_config
 from bellwether.logs import configure_logging
 from bellwether.models import ActionKind, ApprovalState
@@ -61,18 +61,28 @@ def _run(config: BellwetherConfig, args: argparse.Namespace) -> int:
 
 
 def _serve(config: BellwetherConfig, args: argparse.Namespace) -> int:
+    # Slack is required only when it is used; otherwise the JSON API runs alone.
+    slack_enabled = "slack" in config.notify.channels
     secret = config.notify.slack_signing_secret
-    if secret is None or not secret.get_secret_value():
+    signing_secret = secret.get_secret_value() if slack_enabled and secret is not None else None
+    if slack_enabled and not signing_secret:
         print(
-            "bellwether: serve verifies Slack callbacks and requires "
-            f"{env_var_for('notify', 'slack_signing_secret')}",
+            "bellwether: slack is in notify.channels, so serve verifies Slack callbacks and "
+            f"requires {env_var_for('notify', 'slack_signing_secret')}",
             file=sys.stderr,
         )
         return 2
-    if not config.approval.approver_ids:
+    # The allowlist is required only if some approval path is reachable.
+    paths = []
+    if slack_enabled:
+        paths.append("Slack (slack is in notify.channels)")
+    if config.approval.ui_approval_enabled and is_loopback_host(args.host):
+        paths.append("the decision endpoint (approval.ui_approval_enabled on a loopback bind)")
+    if paths and not config.approval.approver_ids:
         print(
-            "bellwether: serve needs at least one Slack approver; set approval.approver_ids "
-            f"or {env_var_for('approval', 'approver_ids')}",
+            f"bellwether: an approval path is enabled ({'; '.join(paths)}) but "
+            f"approval.approver_ids is empty; set it or {env_var_for('approval', 'approver_ids')}, "
+            "or turn those paths off to run a read-only API",
             file=sys.stderr,
         )
         return 2
@@ -80,7 +90,7 @@ def _serve(config: BellwetherConfig, args: argparse.Namespace) -> int:
     executor = pipeline.build_executor(config, store)
     app = create_app(
         store,
-        signing_secret=secret.get_secret_value(),
+        signing_secret=signing_secret,
         approver_ids=config.approval.approver_ids,
         executor=executor,
         bind_host=args.host,
@@ -92,10 +102,14 @@ def _serve(config: BellwetherConfig, args: argparse.Namespace) -> int:
             "host": args.host,
             "port": args.port,
             "executor_enabled": executor is not None,
+            "slack_enabled": app.state.slack_enabled,
             "ui_approval_permitted": app.state.ui_approval_permitted,
+            "read_only": not app.state.approval_paths,
         },
     )
-    uvicorn.run(app, host=args.host, port=args.port, log_config=None)
+    # proxy_headers off: X-Forwarded-For must never rewrite the caller address
+    # that the decision endpoint's loopback check reads.
+    uvicorn.run(app, host=args.host, port=args.port, log_config=None, proxy_headers=False)
     return 0
 
 
