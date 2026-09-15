@@ -272,6 +272,9 @@ class ApprovalConfig(_Section):
     """
 
     approver_ids: list[str] = Field(default_factory=list)
+    # The in-UI approve/reject form. It also requires `bellwether serve` to be
+    # bound to a loopback host; both must hold. Slack approval is unaffected.
+    ui_approval_enabled: bool = True
 
     @field_validator("approver_ids")
     @classmethod

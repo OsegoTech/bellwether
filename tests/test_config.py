@@ -544,6 +544,18 @@ def test_approver_ids_must_be_slack_user_ids(
         load_config(write_yaml(tmp_path, data))
 
 
+def test_ui_approval_is_enabled_by_default_and_env_overridable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
+    path = write_yaml(tmp_path, minimal())
+
+    assert load_config(path).approval.ui_approval_enabled is True
+
+    monkeypatch.setenv("BELLWETHER_APPROVAL__UI_APPROVAL_ENABLED", "false")
+    assert load_config(path).approval.ui_approval_enabled is False
+
+
 def test_example_allowlist_fails_closed(secrets_env: None) -> None:
     # Nobody can approve from Slack until an operator names the approvers.
     assert load_config(EXAMPLE_YAML).approval.approver_ids == []

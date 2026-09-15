@@ -463,7 +463,7 @@ def test_ui_unknown_proposal_is_404(client: TestClient) -> None:
     assert client.get(f"/proposals/{'0' * 32}").status_code == 404
 
 
-def test_only_the_slack_callback_accepts_writes(client: TestClient) -> None:
+def test_the_only_write_routes_are_the_two_gated_decision_paths(client: TestClient) -> None:
     writes = {
         (route.path, method)
         for route in client.app.routes  # type: ignore[attr-defined]
@@ -471,7 +471,8 @@ def test_only_the_slack_callback_accepts_writes(client: TestClient) -> None:
         if method not in {"GET", "HEAD"}
     }
 
-    assert writes == {("/slack/actions", "POST")}
+    # Slack (signature + allowlist) and the in-UI form (loopback + allowlist).
+    assert writes == {("/slack/actions", "POST"), ("/proposals/{proposal_id}/decision", "POST")}
 
 
 def test_healthz(client: TestClient) -> None:

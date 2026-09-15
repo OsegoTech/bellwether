@@ -1,45 +1,56 @@
-"""Approval endpoint and read-only UI (BUILD_SPEC §3.9). Served by ``bellwether serve``.
+"""Approval endpoint and operations UI (BUILD_SPEC §3.9). Served by ``bellwether serve``.
 
-``POST /slack/actions`` receives Slack interactive callbacks. The Slack
-signature is verified before anything else — an unverified approval endpoint
-is a hole — using Slack's v0 scheme (HMAC-SHA256 over ``v0:<ts>:<raw body>``
-with the signing secret), a constant-time compare, and a five-minute replay
-window. Anything that fails is a 401 and changes nothing.
+**Two write paths, each independently gated, both audited.**
 
-A verified click is then checked against ``approval.approver_ids`` (Slack user
-IDs). A click from anyone else is refused with 403, changes no state, never
-reaches the executor, and is recorded as an ``unauthorized_decision`` audit
-event. The allowlist is required: an app without approvers cannot be built.
+1. ``POST /slack/actions`` — Slack interactive callbacks. Gated by the Slack
+   signature (Slack's v0 scheme: HMAC-SHA256 over ``v0:<ts>:<raw body>`` with
+   the signing secret, a constant-time compare, a five-minute replay window;
+   anything that fails is a 401 and changes nothing) and then by
+   ``approval.approver_ids``.
+2. ``POST /proposals/{id}/decision`` — the in-UI approve/reject form. Gated by
+   the bind address (it refuses with 403 unless ``approval.ui_approval_enabled``
+   is true AND the server is bound to a loopback host) and then by the same
+   ``approval.approver_ids``.
 
-A verified, allowlisted Approve records the APPROVED transition. If the proposal is
-EXECUTABLE, the executor runs after the response is sent (Slack wants an answer
-within three seconds); the executor records EXECUTED or FAILED itself. A
-verified Reject records REJECTED.
+Why loopback: in-UI approval is for an operator inside the trust boundary —
+SSH-tunnelled to the host — never for the public internet. The public
+approval path is Slack, which proves who clicked with a signature; the UI path
+proves presence on the host instead. An approver id typed into the form is an
+attestation checked against the allowlist, and host access is the
+authentication — which is exactly why a publicly bound server must not accept it.
 
-``GET /`` and ``GET /proposals/{id}`` are a minimal read-only UI. They have no
-forms: the Slack callback is the only route that accepts a write.
+Both paths share one implementation after their gates: an approver outside the
+allowlist is refused with 403, changes nothing, and is recorded as an
+``unauthorized_decision`` audit event; an allowlisted decision re-reads the
+proposal's state from the store (never trusting a page's view of it) and moves
+only a PENDING proposal; an approved EXECUTABLE proposal is handed to the
+executor after the response, through the same code path either way. The
+executor records EXECUTED or FAILED itself.
+
+``GET /`` and ``GET /proposals/{id}`` render the operations UI (bellwether.ui).
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
-import html
+import ipaddress
 import json
 import logging
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import parse_qs
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
+from bellwether import ui
 from bellwether.models import ActionKind, ApprovalRecord, ApprovalState, Proposal
 from bellwether.notify.slack import APPROVE_ACTION_ID, REJECT_ACTION_ID
-from bellwether.notify.stdout import render_text
 from bellwether.store.sqlite import InvalidTransition, SqliteStore
 
 logger = logging.getLogger(__name__)
@@ -55,8 +66,20 @@ class SupportsExecute(Protocol):
 class Decision:
     proposal_id: str
     approve: bool
-    user_id: str
-    actor: str
+    user_id: str  # the approver id checked against approval.approver_ids
+    actor: str  # how the decision is attributed in the audit trail
+    channel: str = "slack"  # "slack" | "ui"
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What a decision did, independent of how the channel reports it."""
+
+    ok: bool
+    status: int
+    proposal_id: str
+    message: str
+    state: str | None = None
 
 
 def verify_slack_signature(
@@ -75,6 +98,18 @@ def verify_slack_signature(
     return hmac.compare_digest(expected, signature)
 
 
+def is_loopback_host(host: str | None) -> bool:
+    """Whether the server's bind address is loopback-only (127.0.0.0/8, ::1, localhost)."""
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 def create_app(
     store: SqliteStore,
     *,
@@ -82,13 +117,48 @@ def create_app(
     approver_ids: Collection[str],
     executor: SupportsExecute | None = None,
     clock: Callable[[], float] = time.time,
+    bind_host: str | None = None,
+    ui_approval_enabled: bool = True,
+    provider_labels: Mapping[str, str] | None = None,
+    cluster_label: str = "rs0",
 ) -> FastAPI:
     if not signing_secret:
         raise ValueError("a Slack signing secret is required")
     if not approver_ids:
         raise ValueError("an approver allowlist (approval.approver_ids) is required; it is empty")
     approvers = frozenset(approver_ids)
+    labels = dict(provider_labels or {})
+    # In-UI approval needs both: the operator's switch, and a loopback-only bind.
+    # An unknown bind address (None) fails closed.
+    loopback = is_loopback_host(bind_host)
+    ui_permitted = ui_approval_enabled and loopback
+    ui_approval = "permitted" if ui_permitted else ("disabled" if not ui_approval_enabled else "not_loopback")
+
     app = FastAPI(title="Bellwether", docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.bind_host = bind_host
+    app.state.ui_approval_permitted = ui_permitted
+
+    def now() -> datetime:
+        return datetime.fromtimestamp(clock(), timezone.utc)
+
+    def updated_note(moment: datetime) -> str:
+        runs = store.list_runs()
+        last = f"last run {ui.relative(runs[-1].finished_at, moment)}" if runs else "no runs yet"
+        return f"updated {moment:%H:%M} UTC · {last}"
+
+    def html_error(title: str, message: str, status: int, back: str = "/") -> HTMLResponse:
+        moment = now()
+        page = ui.error_page(
+            title,
+            message,
+            status=status,
+            back_href=back,
+            cluster_label=cluster_label,
+            updated_note=updated_note(moment),
+        )
+        return HTMLResponse(page, status_code=status)
+
+    # --- write path 1: Slack ------------------------------------------------------------
 
     @app.post("/slack/actions")
     async def slack_actions(request: Request, background: BackgroundTasks) -> JSONResponse:
@@ -105,58 +175,109 @@ def create_app(
                 extra={"client": request.client.host if request.client else None},
             )
             raise HTTPException(status_code=401, detail="invalid Slack signature")
-        decision = _parse_decision(body)
+        decision = _parse_slack_decision(body)
         if decision.user_id not in approvers:
-            return await run_in_threadpool(_refuse, store, decision)
-        return await run_in_threadpool(_decide, store, executor, decision, background)
+            outcome = await run_in_threadpool(_refuse, store, decision)
+        else:
+            outcome = await run_in_threadpool(_decide, store, executor, decision, background)
+        return _slack_response(outcome)
+
+    # --- write path 2: the in-UI form (loopback only) -------------------------------------
+
+    @app.post("/proposals/{proposal_id}/decision")
+    async def ui_decision(
+        proposal_id: str, request: Request, background: BackgroundTasks
+    ) -> Response:
+        back = f"/proposals/{proposal_id}"
+        if not ui_permitted:
+            # A publicly bound server must not accept decisions from a web form:
+            # the UI path authenticates by host access, which only holds on loopback.
+            reason = (
+                "ui_approval_enabled is false"
+                if not ui_approval_enabled
+                else f"server is bound to {bind_host!r}, not a loopback host"
+            )
+            logger.warning(
+                "in-UI decision refused: approval requires a loopback-bound server with "
+                "ui_approval_enabled",
+                extra={
+                    "proposal_id": proposal_id,
+                    "reason": reason,
+                    "client": request.client.host if request.client else None,
+                },
+            )
+            return html_error(
+                "In-UI approval is not available here",
+                "In-UI approval only works on a loopback-bound server with "
+                "approval.ui_approval_enabled. Approve or reject from Slack instead.",
+                403,
+                back,
+            )
+        fields = parse_qs((await request.body()).decode("utf-8", "replace"))
+        approver = _first(fields, "approver_id").strip()
+        verb = _first(fields, "decision")
+        if verb not in ("approve", "reject") or not approver:
+            return html_error(
+                "Incomplete decision", "A decision needs an approver ID and approve or reject.", 400, back
+            )
+        if verb == "approve" and _first(fields, "acknowledge") != "yes":
+            return html_error(
+                "Confirmation required",
+                "Tick the confirmation to approve: approving may let Bellwether change the "
+                "production database.",
+                400,
+                back,
+            )
+        decision = Decision(
+            proposal_id=proposal_id,
+            approve=verb == "approve",
+            user_id=approver,
+            actor=f"ui:{approver}",
+            channel="ui",
+        )
+        if approver not in approvers:
+            outcome = await run_in_threadpool(_refuse, store, decision)
+        else:
+            outcome = await run_in_threadpool(_decide, store, executor, decision, background)
+        if outcome.ok:
+            return RedirectResponse(back, status_code=303)  # post/redirect/get
+        titles = {403: "Not an authorized approver", 404: "No such proposal", 409: "Already decided"}
+        return html_error(titles.get(outcome.status, "Decision refused"), outcome.message, outcome.status, back)
+
+    # --- the operations UI (read-only views) ---------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
-    def index() -> HTMLResponse:
-        rows = "".join(
-            "<tr>"
-            f"<td><a href=\"/proposals/{_e(p.proposal_id)}\"><code>{_e(p.proposal_id)}</code></a></td>"
-            f"<td>{_e(p.created_at.strftime('%Y-%m-%d %H:%M'))}</td>"
-            f"<td>{_e(p.failure_mode)}</td><td>{_e(p.node)}</td>"
-            f"<td>{_e(p.action.kind.value)}</td><td>{_e(p.provider)}</td>"
-            f"<td class=\"{_e(r.state.value)}\">{_e(r.state.value)}</td>"
-            "</tr>"
-            for p, r in reversed(store.list_proposals())
+    def overview() -> HTMLResponse:
+        moment = now()
+        page = ui.overview_page(
+            _overview_rows(store),
+            now=moment,
+            cluster_label=cluster_label,
+            updated_note=updated_note(moment),
         )
-        table = (
-            "<table><thead><tr><th>Proposal</th><th>Created (UTC)</th><th>Failure mode</th>"
-            "<th>Node</th><th>Action</th><th>Provider</th><th>State</th></tr></thead>"
-            f"<tbody>{rows or '<tr><td colspan=7>No proposals yet.</td></tr>'}</tbody></table>"
-        )
-        return HTMLResponse(_page("Bellwether proposals", table))
+        return HTMLResponse(page)
 
     @app.get("/proposals/{proposal_id}", response_class=HTMLResponse)
     def detail(proposal_id: str) -> HTMLResponse:
         proposal = store.get_proposal(proposal_id)
         if proposal is None:
-            raise HTTPException(status_code=404, detail="unknown proposal")
-        record = store.current_state(proposal_id)
-        history = "".join(
-            f"<tr><td>{_e(t.at.strftime('%Y-%m-%d %H:%M:%S'))}</td><td>{_e(t.state.value)}</td>"
-            f"<td>{_e(t.actor or '')}</td><td>{_e(t.result or '')}</td></tr>"
-            for t in store.history(proposal_id)
+            return html_error("No such proposal", f"There is no proposal {proposal_id}.", 404)
+        finding = next((f for f in store.list_findings() if f.finding_id == proposal.finding_id), None)
+        moment = now()
+        page = ui.detail_page(
+            proposal,
+            store.current_state(proposal_id),
+            severity=finding.severity.value if finding else None,
+            summary=finding.summary if finding else None,
+            history=store.history(proposal_id),
+            events=store.list_audit_events(proposal_id),
+            provider_label=labels.get(proposal.provider, proposal.provider.capitalize()),
+            ui_approval=ui_approval,
+            now=moment,
+            cluster_label=cluster_label,
+            updated_note=updated_note(moment),
         )
-        events = "".join(
-            f"<tr><td>{_e(e.at.strftime('%Y-%m-%d %H:%M:%S'))}</td><td>{_e(e.kind)}</td>"
-            f"<td>{_e(e.actor or '')}</td><td>{_e(e.detail)}</td></tr>"
-            for e in store.list_audit_events(proposal_id)
-        )
-        body = (
-            '<p><a href="/">&larr; all proposals</a></p>'
-            f"<pre>{_e(render_text(proposal, record))}</pre>"
-            "<h2>Audit trail</h2><table><thead><tr><th>At (UTC)</th><th>State</th>"
-            f"<th>By</th><th>Result</th></tr></thead><tbody>{history}</tbody></table>"
-        )
-        if events:
-            body += (
-                "<h2>Audit events</h2><table><thead><tr><th>At (UTC)</th><th>Event</th>"
-                f"<th>By</th><th>Detail</th></tr></thead><tbody>{events}</tbody></table>"
-            )
-        return HTMLResponse(_page(f"Proposal {proposal_id}", body))
+        return HTMLResponse(page)
 
     @app.get("/healthz")
     def healthz() -> dict[str, bool]:
@@ -165,7 +286,47 @@ def create_app(
     return app
 
 
-def _parse_decision(body: bytes) -> Decision:
+def _overview_rows(store: SqliteStore) -> list[ui.OverviewRow]:
+    """Proposals with their state, plus the latest run's findings that never escalated."""
+    findings = {f.finding_id: f for f in store.list_findings()}
+    rows = []
+    for proposal, record in store.list_proposals():
+        finding = findings.get(proposal.finding_id)
+        rows.append(
+            ui.OverviewRow(
+                href=f"/proposals/{proposal.proposal_id}",
+                severity=finding.severity.value if finding else None,
+                failure_mode=proposal.failure_mode,
+                node=proposal.node,
+                summary=finding.summary if finding else proposal.action.title,
+                state=record.state.value,
+                at=proposal.created_at,
+            )
+        )
+    runs = store.list_runs()
+    if runs:
+        for finding in store.list_findings(runs[-1].run_id):
+            if not finding.escalated:
+                rows.append(
+                    ui.OverviewRow(
+                        href=None,
+                        severity=finding.severity.value,
+                        failure_mode=finding.failure_mode,
+                        node=finding.node,
+                        summary=finding.summary,
+                        state="noted",
+                        at=finding.detected_at,
+                    )
+                )
+    return rows
+
+
+def _first(fields: Mapping[str, list[str]], name: str) -> str:
+    values = fields.get(name)
+    return values[0] if values else ""
+
+
+def _parse_slack_decision(body: bytes) -> Decision:
     fields = parse_qs(body.decode("utf-8", "replace"))
     raw = fields.get("payload")
     if not raw:
@@ -194,29 +355,47 @@ def _parse_decision(body: bytes) -> Decision:
         approve=action["action_id"] == APPROVE_ACTION_ID,
         user_id=user_id,
         actor=actor,
+        channel="slack",
     )
 
 
-def _refuse(store: SqliteStore, decision: Decision) -> JSONResponse:
-    """A verified click from someone outside the allowlist: record it, change nothing."""
+def _slack_response(outcome: Outcome) -> JSONResponse:
+    body: dict[str, Any] = {
+        "ok": outcome.ok,
+        "proposal_id": outcome.proposal_id,
+        "message": outcome.message,
+    }
+    if outcome.state is not None:
+        body["state"] = outcome.state
+    return JSONResponse(body, status_code=outcome.status)
+
+
+def _refuse(store: SqliteStore, decision: Decision) -> Outcome:
+    """A decision from someone outside the allowlist: record it, change nothing."""
     verb = "approve" if decision.approve else "reject"
     store.record_audit_event(
         "unauthorized_decision",
         proposal_id=decision.proposal_id,
         actor=decision.actor,
-        detail=f"{verb} refused: Slack user {decision.user_id} is not in approval.approver_ids",
+        detail=(
+            f"{verb} refused: {decision.channel} approver {decision.user_id} is not in "
+            "approval.approver_ids"
+        ),
     )
     logger.warning(
-        "slack decision refused: user not in approver allowlist",
-        extra={"proposal_id": decision.proposal_id, "actor": decision.actor, "decision": verb},
-    )
-    return JSONResponse(
-        {
-            "ok": False,
+        "decision refused: approver not in allowlist",
+        extra={
             "proposal_id": decision.proposal_id,
-            "message": f"{decision.actor} is not an authorized approver; nothing was changed",
+            "actor": decision.actor,
+            "decision": verb,
+            "channel": decision.channel,
         },
-        status_code=403,
+    )
+    return Outcome(
+        ok=False,
+        status=403,
+        proposal_id=decision.proposal_id,
+        message=f"{decision.actor} is not an authorized approver; nothing was changed",
     )
 
 
@@ -225,28 +404,32 @@ def _decide(
     executor: SupportsExecute | None,
     decision: Decision,
     background: BackgroundTasks,
-) -> JSONResponse:
+) -> Outcome:
+    """Apply an allowlisted decision. State is re-read from the store, never trusted."""
     proposal_id = decision.proposal_id
     proposal = store.get_proposal(proposal_id)
     if proposal is None:
-        return JSONResponse({"ok": False, "message": "unknown proposal"}, status_code=404)
+        return Outcome(ok=False, status=404, proposal_id=proposal_id, message="unknown proposal")
     target = ApprovalState.APPROVED if decision.approve else ApprovalState.REJECTED
     try:
         record = store.record_approval_transition(proposal_id, target, by=decision.actor)
     except InvalidTransition:
         current = store.current_state(proposal_id).state.value
-        return JSONResponse(
-            {
-                "ok": False,
-                "proposal_id": proposal_id,
-                "state": current,
-                "message": f"already {current}",
-            },
-            status_code=409,
+        return Outcome(
+            ok=False,
+            status=409,
+            proposal_id=proposal_id,
+            message=f"already {current}",
+            state=current,
         )
     logger.info(
-        "slack decision recorded",
-        extra={"proposal_id": proposal_id, "state": target.value, "actor": decision.actor},
+        "decision recorded",
+        extra={
+            "proposal_id": proposal_id,
+            "state": target.value,
+            "actor": decision.actor,
+            "channel": decision.channel,
+        },
     )
 
     message = f"{target.value} by {decision.actor}"
@@ -258,8 +441,8 @@ def _decide(
             message += "; executor not enabled, run the command manually"
         else:
             message += "; propose-only, run the command manually"
-    return JSONResponse(
-        {"ok": True, "proposal_id": proposal_id, "state": record.state.value, "message": message}
+    return Outcome(
+        ok=True, status=200, proposal_id=proposal_id, message=message, state=record.state.value
     )
 
 
@@ -271,21 +454,3 @@ def _execute(executor: SupportsExecute, proposal: Proposal, record: ApprovalReco
             "execution after approval did not complete",
             extra={"proposal_id": proposal.proposal_id},
         )
-
-
-def _e(value: str) -> str:
-    return html.escape(value, quote=True)
-
-
-def _page(title: str, body: str) -> str:
-    return (
-        "<!doctype html><html><head><meta charset=\"utf-8\">"
-        f"<title>{_e(title)}</title><style>"
-        "body{font:14px/1.45 system-ui,sans-serif;margin:2rem;color:#1d1d1f}"
-        "table{border-collapse:collapse;width:100%}"
-        "th,td{text-align:left;padding:.35rem .6rem;border-bottom:1px solid #ddd}"
-        "pre{background:#f6f6f6;padding:1rem;overflow-x:auto;white-space:pre-wrap}"
-        ".pending{color:#9a6700}.approved,.executed{color:#1a7f37}"
-        ".rejected,.failed,.expired{color:#cf222e}"
-        f"</style></head><body><h1>{_e(title)}</h1>{body}</body></html>"
-    )

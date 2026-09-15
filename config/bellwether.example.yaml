@@ -60,6 +60,10 @@ approval:
   # refuses to start until this is set.
   # Env: BELLWETHER_APPROVAL__APPROVER_IDS='["U0123ABCD"]'
   approver_ids: []
+  # The approve/reject form in the operations UI. Works only when this is true
+  # AND `bellwether serve` is bound to a loopback host (reach it over an SSH
+  # tunnel); on a public bind the form is refused. Slack approval is unaffected.
+  ui_approval_enabled: true
 
 store:
   sqlite_path: /var/lib/bellwether/bellwether.db

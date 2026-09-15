@@ -23,12 +23,14 @@ from collections.abc import Callable, Sequence
 import uvicorn
 
 from bellwether import pipeline
+from bellwether.analysis.analyst import replica_set_name
 from bellwether.app import create_app
 from bellwether.config import BellwetherConfig, ConfigError, env_var_for, load_config
 from bellwether.logs import configure_logging
 from bellwether.models import ActionKind, ApprovalState
 from bellwether.notify.stdout import render_text
 from bellwether.store.sqlite import InvalidTransition
+from bellwether.ui import model_label
 
 logger = logging.getLogger(__name__)
 
@@ -78,15 +80,31 @@ def _serve(config: BellwetherConfig, args: argparse.Namespace) -> int:
         return 2
     store = pipeline.build_store(config)
     executor = pipeline.build_executor(config, store)
+    analysis = config.analysis
+    labels = {
+        provider: model_label(model)
+        for provider, model in (("claude", analysis.claude_model), ("openai", analysis.openai_model))
+        if model
+    }
+    members = [config.mongo.target_node, *config.mongo.fallback_nodes]
     app = create_app(
         store,
         signing_secret=secret.get_secret_value(),
         approver_ids=config.approval.approver_ids,
         executor=executor,
+        bind_host=args.host,
+        ui_approval_enabled=config.approval.ui_approval_enabled,
+        provider_labels=labels,
+        cluster_label=f"{replica_set_name(config.mongo)} · {len(dict.fromkeys(members))} members",
     )
     logger.info(
-        "serving approval endpoint",
-        extra={"host": args.host, "port": args.port, "executor_enabled": executor is not None},
+        "serving approval endpoint and operations UI",
+        extra={
+            "host": args.host,
+            "port": args.port,
+            "executor_enabled": executor is not None,
+            "ui_approval_permitted": app.state.ui_approval_permitted,
+        },
     )
     uvicorn.run(app, host=args.host, port=args.port, log_config=None)
     return 0

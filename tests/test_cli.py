@@ -369,6 +369,23 @@ def test_serve_starts_uvicorn_on_localhost(
     assert isinstance(started["app"], FastAPI)
     assert started["host"] == "127.0.0.1"
     assert started["port"] == 8099
+    assert started["app"].state.ui_approval_permitted is True  # loopback-bound
+
+
+def test_serve_on_a_public_interface_disables_in_ui_approval(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BELLWETHER_NOTIFY__SLACK_SIGNING_SECRET", "s3cret")
+    monkeypatch.setenv("BELLWETHER_APPROVAL__APPROVER_IDS", '["U0OSEGO"]')
+    started: dict[str, Any] = {}
+
+    def fake_run(app: FastAPI, **kwargs: Any) -> None:
+        started["app"] = app
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+
+    assert cli.main(["--config", str(config_path), "serve", "--host", "0.0.0.0"]) == 0
+    assert started["app"].state.ui_approval_permitted is False
 
 
 # --- configuration errors ---------------------------------------------------------------------
