@@ -1,0 +1,26 @@
+# The Bellwether HTTP API: read endpoints, the Slack callback, and the
+# decision endpoint. Bound to loopback: the decision endpoint only works on a
+# loopback bind. Put a TLS reverse proxy in front for the Slack callback.
+[Unit]
+Description=Bellwether HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bellwether
+Group=bellwether
+EnvironmentFile=/etc/bellwether/bellwether.env
+Environment=BELLWETHER_CONFIG=/etc/bellwether/bellwether.yaml
+ExecStart=/opt/bellwether/.venv/bin/bellwether serve --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5s
+StateDirectory=bellwether
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bellwether
+
+[Install]
+WantedBy=multi-user.target

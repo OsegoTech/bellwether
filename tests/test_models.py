@@ -14,7 +14,7 @@ def finding_with_horizon(horizon_seconds: int | None) -> Finding:
         signal_class=SignalClass.REPLICATION,
         failure_mode="oplog_window_below_resync",
         severity=Severity.CRITICAL,
-        node="node-backup.mongo.internal:27017",
+        node="mongo-hidden.example.internal:27017",
         summary="Oplog window is 40 min.",
         evidence=(Evidence("oplog_window_seconds", 2400, "s"),),
         horizon_seconds=horizon_seconds,

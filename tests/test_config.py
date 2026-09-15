@@ -38,23 +38,23 @@ SECRETS = {
     SLACK_SIGNING: "slack-signing-test-0000",
 }
 
-# Nearest voter to the West-Europe monitoring host first.
+# Nearest voter to the monitoring host first.
 FALLBACK_ORDER = [
-    "node-westeurope.mongo.internal:27017",
-    "node-uae.mongo.internal:27017",
-    "node-southafrica.mongo.internal:27017",
+    "mongo-1.example.internal:27017",
+    "mongo-2.example.internal:27017",
+    "mongo-3.example.internal:27017",
 ]
 
 READ_URI = (
-    "mongodb://node-backup.mongo.internal:27017/"
+    "mongodb://mongo-hidden.example.internal:27017/"
     "?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true"
 )
 
 
 # The write side routes through the replica set so index builds reach the primary.
 EXEC_RS_URI = (
-    "mongodb://node-westeurope.mongo.internal:27017,node-uae.mongo.internal:27017,"
-    "node-southafrica.mongo.internal:27017/"
+    "mongodb://mongo-1.example.internal:27017,mongo-2.example.internal:27017,"
+    "mongo-3.example.internal:27017/"
     "?replicaSet=rs0&authMechanism=MONGODB-X509&authSource=%24external&tls=true"
 )
 
@@ -63,7 +63,7 @@ def executor_block(**overrides: Any) -> dict[str, Any]:
     block: dict[str, Any] = {
         "enabled": True,
         "mongo_uri": EXEC_RS_URI,
-        "tls_cert_file": "/etc/bellwether/tls/meetadev-ai-exec.combined.pem",
+        "tls_cert_file": "/etc/bellwether/tls/bellwether-exec.combined.pem",
         "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
         "allowed_actions": ["kill_op"],
     }
@@ -91,8 +91,8 @@ def minimal() -> dict[str, Any]:
         "mongo": {
             "uri": READ_URI,
             "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
-            "tls_cert_file": "/etc/bellwether/tls/meetadev-ai.combined.pem",
-            "target_node": "node-backup.mongo.internal:27017",
+            "tls_cert_file": "/etc/bellwether/tls/bellwether-reader.combined.pem",
+            "target_node": "mongo-hidden.example.internal:27017",
         },
         "analysis": {
             "primary_provider": "claude",
@@ -117,12 +117,12 @@ def test_loads_example_yaml(secrets_env: None) -> None:
     cfg = load_config(EXAMPLE_YAML)
 
     assert isinstance(cfg, BellwetherConfig)
-    assert cfg.mongo.target_node == "node-backup.mongo.internal:27017"
+    assert cfg.mongo.target_node == "mongo-hidden.example.internal:27017"
     assert cfg.mongo.fallback_nodes == FALLBACK_ORDER
     assert cfg.mongo.tls_ca_file == Path("/etc/mongodb/tls/ca-chain.cert.pem")
     assert "MONGODB-X509" in cfg.mongo.uri
     assert cfg.prometheus.enabled is True
-    assert cfg.prometheus.base_url == "http://10.3.2.4:9090"
+    assert cfg.prometheus.base_url == "http://prometheus.example.internal:9090"
     assert cfg.analysis.primary_provider == "claude"
     assert cfg.analysis.fallback_provider == "openai"
     assert cfg.analysis.escalate_min_severity is Severity.WARNING
@@ -348,7 +348,7 @@ def test_executor_must_not_reuse_read_identity_cert(
     data = minimal()
     data["executor"] = executor_block(tls_cert_file=data["mongo"]["tls_cert_file"])
 
-    with pytest.raises(ConfigError, match="meetadev-ai-exec"):
+    with pytest.raises(ConfigError, match="bellwether-exec"):
         load_config(write_yaml(tmp_path, data))
 
 
@@ -397,7 +397,7 @@ def test_cert_params_in_uri_are_rejected(
 def test_password_in_uri_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     data = minimal()
-    data["mongo"]["uri"] = "mongodb://someone:s3cret-pw@node-backup.mongo.internal:27017/"
+    data["mongo"]["uri"] = "mongodb://someone:s3cret-pw@mongo-hidden.example.internal:27017/"
 
     with pytest.raises(ConfigError, match="mongo.uri") as excinfo:
         load_config(write_yaml(tmp_path, data))
@@ -409,7 +409,7 @@ def test_srv_uri_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     """Direct per-node connections need a plain mongodb:// URI."""
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     data = minimal()
-    data["mongo"]["uri"] = "mongodb+srv://cluster.mongo.internal/"
+    data["mongo"]["uri"] = "mongodb+srv://cluster.example.internal/"
 
     with pytest.raises(ConfigError, match="mongo.uri"):
         load_config(write_yaml(tmp_path, data))
@@ -443,7 +443,7 @@ def test_executor_uri_must_name_the_replica_set(
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     data = minimal()
     data["executor"] = executor_block(
-        mongo_uri="mongodb://node-westeurope.mongo.internal:27017,node-uae.mongo.internal:27017/"
+        mongo_uri="mongodb://mongo-1.example.internal:27017,mongo-2.example.internal:27017/"
         "?authMechanism=MONGODB-X509&authSource=%24external&tls=true"
     )
 
@@ -598,7 +598,7 @@ def test_unknown_yaml_key_is_rejected(
 ) -> None:
     monkeypatch.setenv(ANTHROPIC_KEY, SECRETS[ANTHROPIC_KEY])
     data = minimal()
-    data["mongo"]["target_nod"] = "typo.mongo.internal:27017"
+    data["mongo"]["target_nod"] = "typo.example.internal:27017"
 
     with pytest.raises(ConfigError, match="target_nod"):
         load_config(write_yaml(tmp_path, data))

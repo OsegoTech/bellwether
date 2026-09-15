@@ -1,8 +1,9 @@
-# Bellwether example configuration — grounded in the rs0 cluster (BUILD_SPEC §1).
+# Bellwether example configuration. Every host, path and name is a placeholder:
+# replace them with your deployment's. Copy to /etc/bellwether/bellwether.yaml.
 #
 # Every value here can be overridden by an env var: BELLWETHER_<SECTION>__<KEY>,
 # e.g. BELLWETHER_PROMETHEUS__BASE_URL. Lists take JSON:
-#   BELLWETHER_MONGO__FALLBACK_NODES='["node-uae.mongo.internal:27017"]'
+#   BELLWETHER_MONGO__FALLBACK_NODES='["mongo-2.example.internal:27017"]'
 #
 # SECRETS NEVER GO IN THIS FILE. A secret key found here is a load-time error.
 # Required at load time for the features enabled below:
@@ -19,25 +20,25 @@
 # is a load-time error.
 
 mongo:
-  # Read identity meetadev-ai (clusterMonitor@admin, read@local,
-  # read@meetadev_ledger). X.509 over mutual TLS; hostname verification stays on.
+  # Read identity bellwether-reader (clusterMonitor@admin, read@local,
+  # read@appdb). X.509 over mutual TLS; hostname verification stays on.
   # The host here is replaced per attempt by target_node, then fallback_nodes.
   # In a systemd unit, write %24external as %%24external.
-  uri: "mongodb://node-backup.mongo.internal:27017/?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true"
+  uri: "mongodb://mongo-hidden.example.internal:27017/?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true"
   tls_ca_file: /etc/mongodb/tls/ca-chain.cert.pem
-  tls_cert_file: /etc/bellwether/tls/meetadev-ai.combined.pem   # cert + key, one PEM
+  tls_cert_file: /etc/bellwether/tls/bellwether-reader.combined.pem   # cert + key, one PEM
   # Hidden, non-voting, priority-0 member: diagnostic reads never land on the primary.
-  target_node: node-backup.mongo.internal:27017
+  target_node: mongo-hidden.example.internal:27017
   # Tried in order if the target is unreachable — nearest voter to the
-  # West-Europe monitoring host first.
+  # monitoring host first.
   fallback_nodes:
-    - node-westeurope.mongo.internal:27017
-    - node-uae.mongo.internal:27017
-    - node-southafrica.mongo.internal:27017
+    - mongo-1.example.internal:27017
+    - mongo-2.example.internal:27017
+    - mongo-3.example.internal:27017
 
 prometheus:
   enabled: true
-  base_url: http://10.3.2.4:9090
+  base_url: http://prometheus.example.internal:9090
 
 analysis:
   primary_provider: claude
@@ -60,9 +61,10 @@ approval:
   # refuses to start until this is set.
   # Env: BELLWETHER_APPROVAL__APPROVER_IDS='["U0123ABCD"]'
   approver_ids: []
-  # The approve/reject form in the operations UI. Works only when this is true
-  # AND `bellwether serve` is bound to a loopback host (reach it over an SSH
-  # tunnel); on a public bind the form is refused. Slack approval is unaffected.
+  # POST /api/proposals/{id}/decision. Works only when this is true AND
+  # `bellwether serve` is bound to a loopback host (reach it over an SSH tunnel
+  # or a local proxy); on a public bind it is refused (403). Slack approval is
+  # unaffected. The same approver_ids apply.
   ui_approval_enabled: true
 
 store:
@@ -75,9 +77,9 @@ collectors:
     sample_interval_seconds: 10
   query_profile:
     # Application databases whose profiler (system.profile) is read. Empty:
-    # every database except admin/local/config. read@meetadev_ledger exists for this.
+    # every database except admin/local/config. read@appdb exists for this.
     databases:
-      - meetadev_ledger
+      - appdb
     slow_ms: 100                   # Performance Advisor's slow-query threshold
     examined_returned_ratio: 100   # non-COLLSCAN slow ops kept above this
     max_profile_entries: 500       # newest profiler entries read per database
@@ -101,16 +103,16 @@ detectors:
     min_unused_index_age_seconds: 604800 # 7 days of $indexStats before "unused"
 
 executor:
-  # Write identity meetadev-ai-exec — distinct from the read identity above,
+  # Write identity bellwether-exec — distinct from the read identity above,
   # with its own cert. Off until an operator deliberately turns it on.
   enabled: false
   # Replica-set URI: every voting member, replicaSet=rs0, NO directConnection,
   # so create_small_index goes wherever the driver finds the primary. kill_op
   # instead connects directly to the member the runaway op runs on (the
   # finding's node), reusing this URI's auth options with that single host.
-  # PLACEHOLDER — the meetadev-ai-exec identity has not been provisioned.
-  mongo_uri: "mongodb://node-westeurope.mongo.internal:27017,node-uae.mongo.internal:27017,node-southafrica.mongo.internal:27017/?replicaSet=rs0&authMechanism=MONGODB-X509&authSource=%24external&tls=true"
-  tls_cert_file: /etc/bellwether/tls/meetadev-ai-exec.combined.pem  # PLACEHOLDER path
+  # Provision the bellwether-exec identity before enabling (see README).
+  mongo_uri: "mongodb://mongo-1.example.internal:27017,mongo-2.example.internal:27017,mongo-3.example.internal:27017/?replicaSet=rs0&authMechanism=MONGODB-X509&authSource=%24external&tls=true"
+  tls_cert_file: /etc/bellwether/tls/bellwether-exec.combined.pem  # PLACEHOLDER path
   tls_ca_file: /etc/mongodb/tls/ca-chain.cert.pem
   # create_small_index refuses collections estimated above this many documents.
   document_threshold: 100000

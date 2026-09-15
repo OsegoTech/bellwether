@@ -26,14 +26,14 @@ Doc = dict[str, Any]
 CommandHandler = Callable[[str, Doc], Doc]  # (node, command doc) -> reply
 AggregateHandler = Callable[[str, str, list[Doc]], list[Doc]]  # (node, ns, pipeline) -> docs
 
-TARGET = "node-backup.mongo.internal:27017"
-WESTEUROPE = "node-westeurope.mongo.internal:27017"
-UAE = "node-uae.mongo.internal:27017"
-SOUTHAFRICA = "node-southafrica.mongo.internal:27017"
-FALLBACKS = [WESTEUROPE, UAE, SOUTHAFRICA]
+TARGET = "mongo-hidden.example.internal:27017"
+MEMBER_1 = "mongo-1.example.internal:27017"
+MEMBER_2 = "mongo-2.example.internal:27017"
+MEMBER_3 = "mongo-3.example.internal:27017"
+FALLBACKS = [MEMBER_1, MEMBER_2, MEMBER_3]
 
 READ_URI = (
-    "mongodb://node-backup.mongo.internal:27017/"
+    "mongodb://mongo-hidden.example.internal:27017/"
     "?authMechanism=MONGODB-X509&authSource=%24external&tls=true&directConnection=true"
 )
 
@@ -242,7 +242,7 @@ def write_config(directory: Path, **sections: Doc) -> Path:
         "mongo": {
             "uri": READ_URI,
             "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
-            "tls_cert_file": "/etc/bellwether/tls/meetadev-ai.combined.pem",
+            "tls_cert_file": "/etc/bellwether/tls/bellwether-reader.combined.pem",
             "target_node": TARGET,
             "fallback_nodes": FALLBACKS,
         },

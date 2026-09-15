@@ -17,7 +17,7 @@ import pytest
 
 from bellwether.detectors.query_shape import impact, rank_impacts, shape_of
 
-NS = "meetadev_ledger.transactions"
+NS = "appdb.transactions"
 
 
 def op(

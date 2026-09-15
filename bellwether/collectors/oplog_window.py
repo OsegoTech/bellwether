@@ -22,6 +22,8 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any, ClassVar
 
+from pymongo.errors import OperationFailure
+
 from bellwether.collectors.base import Collector
 from bellwether.config import OplogWindowCollectorConfig
 from bellwether.models import Evidence, Signal, SignalClass
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 RATE_SAMPLED = "repl_network_sample"
 RATE_MEAN = "oplog_mean"
+NAMESPACE_NOT_FOUND = 26  # local.oplog.rs absent: a standalone, not a replica-set member
 
 
 class OplogWindowCollector(Collector):
@@ -50,7 +53,18 @@ class OplogWindowCollector(Collector):
         return SignalClass.REPLICATION
 
     def collect(self, mongo: ReadOnlyMongo) -> Signal | None:
-        stats = mongo.oplog_stats()
+        try:
+            stats = mongo.oplog_stats()
+        except OperationFailure as exc:
+            if exc.code != NAMESPACE_NOT_FOUND:
+                raise
+            # A standalone instance (not a replica-set member) has no oplog: there
+            # is no replication window to watch, so no signal rather than an error.
+            logger.info(
+                "no oplog on this node (a standalone instance); no oplog signal",
+                extra={"node": mongo.served_by},
+            )
+            return None
         node = mongo.served_by or "unknown"
         window = stats.window_seconds
         if window is None or window <= 0:

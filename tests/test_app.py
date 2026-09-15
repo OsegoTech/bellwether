@@ -51,7 +51,7 @@ def make_proposal(kind: ActionKind = ActionKind.EXECUTABLE, **overrides: Any) ->
             reversible=True,
             executor_op="create_small_index",
             executor_args={
-                "db": "meetadev_ledger",
+                "db": "appdb",
                 "collection": "transactions",
                 "keys": [{"field": "account_id", "direction": 1}],
                 "estimated_docs": 40_000,
@@ -68,7 +68,7 @@ def make_proposal(kind: ActionKind = ActionKind.EXECUTABLE, **overrides: Any) ->
     values: dict[str, Any] = {
         "finding_id": "f" * 32,
         "failure_mode": "oplog_window_below_resync",
-        "node": "node-backup.mongo.internal:27017",
+        "node": "mongo-hidden.example.internal:27017",
         "diagnosis": "Window 40 min < resync 60 min.",
         "mechanism": "Capped oplog.",
         "impact_if_ignored": "Initial sync after maintenance.",
@@ -416,10 +416,11 @@ def test_refused_attempt_appears_in_the_audit_trail(
     body = slack_body(APPROVE_ACTION_ID, proposal.proposal_id, user=MALLORY)
     post(client, body, signed(body))
 
-    page = client.get(f"/proposals/{proposal.proposal_id}").text
+    audit = client.get(f"/api/proposals/{proposal.proposal_id}/audit").json()
 
-    assert "unauthorized_decision" in page
-    assert "U0MALLORY" in page
+    [event] = audit["audit_events"]
+    assert event["kind"] == "unauthorized_decision"
+    assert "U0MALLORY" in event["actor"]
 
 
 def test_an_approver_allowlist_is_required(store: SqliteStore) -> None:
@@ -427,40 +428,7 @@ def test_an_approver_allowlist_is_required(store: SqliteStore) -> None:
         create_app(store, signing_secret=SECRET, approver_ids=set())
 
 
-# --- Read-only UI ---------------------------------------------------------------------
-
-
-def test_ui_lists_proposals_and_state(client: TestClient, store: SqliteStore) -> None:
-    a = make_proposal()
-    b = make_proposal(ActionKind.PROPOSE_ONLY, diagnosis="<script>alert(1)</script>")
-    store.record_proposal(a)
-    store.record_proposal(b)
-    store.record_approval_transition(b.proposal_id, ApprovalState.REJECTED, by="x")
-
-    response = client.get("/")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/html")
-    page = response.text
-    assert a.proposal_id in page and b.proposal_id in page
-    assert "pending" in page and "rejected" in page
-    assert "<form" not in page
-
-
-def test_ui_detail_page_escapes_model_text(client: TestClient, store: SqliteStore) -> None:
-    proposal = make_proposal(diagnosis="<script>alert(1)</script>")
-    store.record_proposal(proposal)
-
-    response = client.get(f"/proposals/{proposal.proposal_id}")
-
-    assert response.status_code == 200
-    assert "<script>alert(1)</script>" not in response.text
-    assert "&lt;script&gt;" in response.text
-    assert proposal.action.command in response.text
-
-
-def test_ui_unknown_proposal_is_404(client: TestClient) -> None:
-    assert client.get(f"/proposals/{'0' * 32}").status_code == 404
+# --- The API surface ---------------------------------------------------------------------
 
 
 def test_the_only_write_routes_are_the_two_gated_decision_paths(client: TestClient) -> None:
@@ -471,8 +439,8 @@ def test_the_only_write_routes_are_the_two_gated_decision_paths(client: TestClie
         if method not in {"GET", "HEAD"}
     }
 
-    # Slack (signature + allowlist) and the in-UI form (loopback + allowlist).
-    assert writes == {("/slack/actions", "POST"), ("/proposals/{proposal_id}/decision", "POST")}
+    # Slack (signature + allowlist) and the JSON decision API (loopback + allowlist).
+    assert writes == {("/slack/actions", "POST"), ("/api/proposals/{proposal_id}/decision", "POST")}
 
 
 def test_healthz(client: TestClient) -> None:

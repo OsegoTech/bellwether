@@ -30,7 +30,7 @@ from bellwether.models import (
 from bellwether.store.sqlite import InvalidTransition, ProposalNotFound, RunRecord, SqliteStore
 
 T0 = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
-NODE = "node-backup.mongo.internal:27017"
+NODE = "mongo-hidden.example.internal:27017"
 
 
 def make_proposal(**overrides: Any) -> Proposal:
@@ -49,7 +49,7 @@ def make_proposal(**overrides: Any) -> Proposal:
             reversible=True,
             executor_op="create_small_index",
             executor_args={
-                "db": "meetadev_ledger",
+                "db": "appdb",
                 "collection": "transactions",
                 "keys": [{"field": "account_id", "direction": 1}],
                 "estimated_docs": 40_000,
@@ -372,13 +372,13 @@ def test_has_pending_can_be_narrowed_to_a_subject(store: SqliteStore) -> None:
     # shape, not one per failure mode.
     proposal = make_proposal(
         failure_mode="missing_index_collscan",
-        evidence_refs=(Evidence("subject", "meetadev_ledger.transactions#aaaa", observed_at=T0),),
+        evidence_refs=(Evidence("subject", "appdb.transactions#aaaa", observed_at=T0),),
     )
     store.record_proposal(proposal)
 
     assert store.has_pending("missing_index_collscan", NODE)
-    assert store.has_pending("missing_index_collscan", NODE, subject="meetadev_ledger.transactions#aaaa")
-    assert not store.has_pending("missing_index_collscan", NODE, subject="meetadev_ledger.transactions#bbbb")
+    assert store.has_pending("missing_index_collscan", NODE, subject="appdb.transactions#aaaa")
+    assert not store.has_pending("missing_index_collscan", NODE, subject="appdb.transactions#bbbb")
 
 
 def test_a_subject_identifies_the_finding_whatever_the_node(store: SqliteStore) -> None:
@@ -386,13 +386,13 @@ def test_a_subject_identifies_the_finding_whatever_the_node(store: SqliteStore) 
     # was placed on can change between runs without it being a new finding.
     proposal = make_proposal(
         failure_mode="missing_index_collscan",
-        node="node-uae.mongo.internal:27017",
-        evidence_refs=(Evidence("subject", "meetadev_ledger.transactions#aaaa", observed_at=T0),),
+        node="mongo-2.example.internal:27017",
+        evidence_refs=(Evidence("subject", "appdb.transactions#aaaa", observed_at=T0),),
     )
     store.record_proposal(proposal)
 
     assert store.has_pending(
-        "missing_index_collscan", NODE, subject="meetadev_ledger.transactions#aaaa"
+        "missing_index_collscan", NODE, subject="appdb.transactions#aaaa"
     )
     assert not store.has_pending("missing_index_collscan", NODE)  # no subject: node still counts
 

@@ -165,7 +165,7 @@ class QueryProfileCollector(Collector):
     def _profiling_level(reader: ReadOnlyMongo, db: str) -> Level:
         # Deliberate, accepted blind spot. {profile: -1} needs the enableProfiler
         # action, and MongoDB grants that only through dbAdmin — bundled with
-        # createIndex, dropIndex and dropDatabase. meetadev-ai is a read identity
+        # createIndex, dropIndex and dropDatabase. bellwether-reader is a read identity
         # and will not be given dbAdmin to learn a profiler level. So the level is
         # often refused: it is recorded as unknown, system.profile is read anyway
         # (reading it is covered by read@<db>, as $collStats is; $indexStats by

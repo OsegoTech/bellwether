@@ -1,7 +1,7 @@
 """Command-line entrypoint (BUILD_SPEC §3.10).
 
     bellwether run                      one pipeline pass (for the systemd timer)
-    bellwether serve                    approval endpoint + read-only UI
+    bellwether serve                    the HTTP API (read endpoints, approvals; docs at /docs)
     bellwether list [--pending]         proposals and their state
     bellwether show <id>                one proposal with its audit trail
     bellwether approve <id> --by NAME   manual approval, independent of Slack
@@ -23,14 +23,12 @@ from collections.abc import Callable, Sequence
 import uvicorn
 
 from bellwether import pipeline
-from bellwether.analysis.analyst import replica_set_name
 from bellwether.app import create_app
 from bellwether.config import BellwetherConfig, ConfigError, env_var_for, load_config
 from bellwether.logs import configure_logging
 from bellwether.models import ActionKind, ApprovalState
 from bellwether.notify.stdout import render_text
 from bellwether.store.sqlite import InvalidTransition
-from bellwether.ui import model_label
 
 logger = logging.getLogger(__name__)
 
@@ -80,13 +78,6 @@ def _serve(config: BellwetherConfig, args: argparse.Namespace) -> int:
         return 2
     store = pipeline.build_store(config)
     executor = pipeline.build_executor(config, store)
-    analysis = config.analysis
-    labels = {
-        provider: model_label(model)
-        for provider, model in (("claude", analysis.claude_model), ("openai", analysis.openai_model))
-        if model
-    }
-    members = [config.mongo.target_node, *config.mongo.fallback_nodes]
     app = create_app(
         store,
         signing_secret=secret.get_secret_value(),
@@ -94,11 +85,9 @@ def _serve(config: BellwetherConfig, args: argparse.Namespace) -> int:
         executor=executor,
         bind_host=args.host,
         ui_approval_enabled=config.approval.ui_approval_enabled,
-        provider_labels=labels,
-        cluster_label=f"{replica_set_name(config.mongo)} · {len(dict.fromkeys(members))} members",
     )
     logger.info(
-        "serving approval endpoint and operations UI",
+        "serving the HTTP API",
         extra={
             "host": args.host,
             "port": args.port,
@@ -195,7 +184,7 @@ def _parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="one pipeline pass")
     run.set_defaults(handler=_run)
 
-    serve = commands.add_parser("serve", help="approval endpoint and read-only UI")
+    serve = commands.add_parser("serve", help="the HTTP API (docs at /docs)")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.set_defaults(handler=_serve)

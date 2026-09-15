@@ -17,13 +17,13 @@ def make_record(msg: str = "read served", **extra: object) -> logging.LogRecord:
 
 
 def test_formatter_emits_json_with_extras() -> None:
-    line = JsonFormatter().format(make_record(node="node-backup.mongo.internal:27017"))
+    line = JsonFormatter().format(make_record(node="mongo-hidden.example.internal:27017"))
 
     out = json.loads(line)
     assert out["msg"] == "read served"
     assert out["level"] == "INFO"
     assert out["logger"] == "bellwether.mongo"
-    assert out["node"] == "node-backup.mongo.internal:27017"
+    assert out["node"] == "mongo-hidden.example.internal:27017"
     assert "ts" in out
 
 

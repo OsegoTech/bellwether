@@ -25,7 +25,7 @@ from bellwether.detectors.query_shape import (
     shape_of_query,
 )
 
-NS = "meetadev_ledger.transactions"
+NS = "appdb.transactions"
 
 
 # --- Spec acceptance ---------------------------------------------------------------
@@ -110,7 +110,7 @@ def test_logical_operators() -> None:
 
 def test_a_different_namespace_is_a_different_shape() -> None:
     a = shape_of_query(NS, {"a": 1})
-    b = shape_of_query("meetadev_ledger.accounts", {"a": 1})
+    b = shape_of_query("appdb.accounts", {"a": 1})
 
     assert a.key != b.key
 

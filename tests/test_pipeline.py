@@ -334,7 +334,7 @@ def test_build_executor_knows_every_configured_member(tmp_path: Path) -> None:
             "enabled": True,
             "mongo_uri": f"mongodb://{','.join(FALLBACKS)}/?replicaSet=rs0"
             "&authMechanism=MONGODB-X509&authSource=%24external&tls=true",
-            "tls_cert_file": "/etc/bellwether/tls/meetadev-ai-exec.combined.pem",
+            "tls_cert_file": "/etc/bellwether/tls/bellwether-exec.combined.pem",
             "tls_ca_file": "/etc/mongodb/tls/ca-chain.cert.pem",
             "allowed_actions": ["kill_op"],
         },

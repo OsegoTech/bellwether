@@ -42,8 +42,8 @@ from bellwether.models import (
 from bellwether.store.sqlite import SqliteStore
 from tests.fakes import PROPOSAL_PAYLOAD, StaticProvider
 
-NODE = "node-backup.mongo.internal:27017"
-DB, COLL = "meetadev_ledger", "transactions"
+NODE = "mongo-hidden.example.internal:27017"
+DB, COLL = "appdb", "transactions"
 NS = f"{DB}.{COLL}"
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 OLD = "2026-08-01T00:00:00+00:00"  # 45 days of index stats
@@ -408,7 +408,7 @@ def test_unknown_profiler_level_still_analyses_the_ops() -> None:
 def test_an_unknown_profiler_level_never_fires_profiler_disabled() -> None:
     # The accepted blind spot: {profile: -1} needs enableProfiler (dbAdmin only),
     # which the read identity does not hold. Unknown is not "off".
-    findings = run(profile_signal(level=None), profile_signal(level=None, node="node-uae.mongo.internal:27017"))
+    findings = run(profile_signal(level=None), profile_signal(level=None, node="mongo-2.example.internal:27017"))
 
     assert of_mode(findings, PROFILER_DISABLED) == []
     assert of_mode(findings, MISSING_INDEX_COLLSCAN)
@@ -416,8 +416,8 @@ def test_an_unknown_profiler_level_never_fires_profiler_disabled() -> None:
 
 # --- Members: signals from every node are merged per collection ----------------------------
 
-PRIMARY = "node-uae.mongo.internal:27017"
-SECONDARY = "node-westeurope.mongo.internal:27017"
+PRIMARY = "mongo-2.example.internal:27017"
+SECONDARY = "mongo-1.example.internal:27017"
 PAIR = [NODE, PRIMARY]
 
 

@@ -83,7 +83,7 @@ def build_payload(proposal: Proposal, record: ApprovalRecord) -> dict[str, Any]:
                 "title": _plain("Run on the cluster?", 100),
                 "text": _plain(
                     f"Approving runs {action.executor_op} against the cluster with the "
-                    "meetadev-ai-exec identity.",
+                    "bellwether-exec identity.",
                     300,
                 ),
                 "confirm": _plain("Approve and run", 30),

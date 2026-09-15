@@ -41,7 +41,7 @@ from tests.fakes import (
     write_config,
 )
 
-DB = "meetadev_ledger"
+DB = "appdb"
 HEALTHY_OPLOG = 6 * 3600
 
 INDEX_PAYLOAD: dict[str, Any] = {
@@ -83,7 +83,7 @@ def find_doc(coll: str, filter: dict[str, Any], sort: dict[str, Any]) -> dict[st
         "millis": 1_840,
         "responseLength": 21_450,
         "ts": datetime(2026, 9, 15, 11, 0),
-        "client": "10.1.1.4",
+        "client": "192.0.2.10",
     }
 
 
@@ -255,5 +255,5 @@ def test_no_literals_reach_the_store(tmp_path: Path) -> None:
     raw = b"".join(f.read_bytes() for f in files)
 
     assert raw  # something was actually stored
-    for literal in (b"ACC-9931", b"Jane Doe", b"10.1.1.4", b"2026-08-17"):
+    for literal in (b"ACC-9931", b"Jane Doe", b"192.0.2.10", b"2026-08-17"):
         assert literal not in raw

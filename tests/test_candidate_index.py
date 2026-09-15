@@ -24,7 +24,7 @@ from bellwether.detectors.query_shape import (
     shape_of_query,
 )
 
-NS = "meetadev_ledger.transactions"
+NS = "appdb.transactions"
 
 
 def keys(filter: dict[str, Any], sort: Any = None, **kw: Any) -> list[tuple[str, int]]:

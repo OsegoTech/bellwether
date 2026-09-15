@@ -1,0 +1,23 @@
+# One Bellwether pipeline pass: collect, detect, analyse, notify.
+# Triggered by bellwether-run.timer; exits when the pass is done.
+[Unit]
+Description=Bellwether pipeline pass
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bellwether
+Group=bellwether
+# API keys and the Slack secrets: BELLWETHER_* variables, readable by root only.
+EnvironmentFile=/etc/bellwether/bellwether.env
+Environment=BELLWETHER_CONFIG=/etc/bellwether/bellwether.yaml
+ExecStart=/opt/bellwether/.venv/bin/bellwether run
+# The analysis call can take up to analysis.timeout_seconds per provider.
+TimeoutStartSec=15min
+StateDirectory=bellwether
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bellwether

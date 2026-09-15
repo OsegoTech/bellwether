@@ -57,7 +57,7 @@ from bellwether.models import (
 )
 
 SCHEMA_FILE = Path(__file__).resolve().parents[1] / "config" / "proposal.schema.json"
-TARGET = "node-backup.mongo.internal:27017"
+TARGET = "mongo-hidden.example.internal:27017"
 
 VALID: dict[str, Any] = {
     "diagnosis": "The oplog holds 40 minutes of history, less than a 60 minute maintenance window.",
@@ -98,7 +98,7 @@ VALID_INDEX: dict[str, Any] = {
         "reversible": True,
         "executor_op": "create_small_index",
         "executor_args": {
-            "db": "meetadev_ledger",
+            "db": "appdb",
             "collection": "transactions",
             "keys": [{"field": "account_id", "direction": 1}],
             "estimated_docs": 40_000,
@@ -172,7 +172,7 @@ def analyst_with(primary: list[object], fallback: list[object]) -> tuple[Analyst
     claude = ScriptedProvider("claude", primary)
     gpt = ScriptedProvider("openai", fallback)
     chain = ProviderChain([claude, gpt], max_retries=1)
-    return Analyst(chain, topology="target node-backup (hidden); fallbacks westeurope, uae"), claude, gpt
+    return Analyst(chain, topology="target mongo-hidden (hidden); fallbacks mongo-1, mongo-2"), claude, gpt
 
 
 # --- Spec acceptance ---------------------------------------------------------
@@ -443,7 +443,7 @@ def test_prompt_carries_finding_topology_and_remediations(finding: Finding) -> N
     assert "critical" in prompt
     for evidence in finding.evidence:
         assert evidence.render() in prompt
-    assert "node-backup (hidden)" in prompt
+    assert "mongo-hidden (hidden)" in prompt
     for hint in KNOWN_REMEDIATIONS["oplog_window_below_resync"]:
         assert hint in prompt
     # Bounded: no raw signal dumps or ids.
@@ -488,9 +488,9 @@ def test_prompt_is_the_designed_version_not_the_stub() -> None:
 # --- The designed prompt: evidence-constrained, mechanism-grounded -----------------
 
 TOPOLOGY = (
-    "Diagnostic reads are served by node-backup.mongo.internal:27017; fallback order: "
-    "node-westeurope.mongo.internal:27017, node-uae.mongo.internal:27017, "
-    "node-southafrica.mongo.internal:27017."
+    "Diagnostic reads are served by mongo-hidden.example.internal:27017; fallback order: "
+    "mongo-1.example.internal:27017, mongo-2.example.internal:27017, "
+    "mongo-3.example.internal:27017."
 )
 
 
@@ -592,14 +592,14 @@ def _mongo_config(uri: str) -> MongoConfig:
     return MongoConfig(
         uri=uri,
         tls_ca_file=Path("/etc/mongodb/tls/ca-chain.cert.pem"),
-        tls_cert_file=Path("/etc/bellwether/tls/meetadev-ai.combined.pem"),
+        tls_cert_file=Path("/etc/bellwether/tls/bellwether-reader.combined.pem"),
         target_node=TARGET,
     )
 
 
 def test_replica_set_name_comes_from_the_uri_else_the_documented_default() -> None:
-    named = "mongodb://node-backup.mongo.internal:27017/?replicaSet=ledger0&tls=true"
-    unnamed = "mongodb://node-backup.mongo.internal:27017/?tls=true&directConnection=true"
+    named = "mongodb://mongo-hidden.example.internal:27017/?replicaSet=ledger0&tls=true"
+    unnamed = "mongodb://mongo-hidden.example.internal:27017/?tls=true&directConnection=true"
 
     assert replica_set_name(_mongo_config(named)) == "ledger0"
     assert replica_set_name(_mongo_config(unnamed)) == DEFAULT_REPLICA_SET == "rs0"
@@ -622,7 +622,7 @@ def index_finding(
     collection: str = "transactions",
 ) -> Finding:
     """A missing_index_collscan finding shaped like IndexAdvisorDetector's."""
-    namespace = f"meetadev_ledger.{collection}"
+    namespace = f"appdb.{collection}"
     return Finding(
         signal_class=SignalClass.PERFORMANCE,
         failure_mode="missing_index_collscan",
@@ -633,7 +633,7 @@ def index_finding(
             f"on {namespace} examined 1,000,000 documents to return 1,000."
         ),
         evidence=(
-            Evidence("db", "meetadev_ledger"),
+            Evidence("db", "appdb"),
             Evidence("collection", collection),
             Evidence("namespace", namespace),
             Evidence("subject", f"{namespace}#0123456789abcdef"),
@@ -650,7 +650,7 @@ def index_finding(
 def index_payload(
     keys: list[dict[str, Any]] | None = None,
     *,
-    db: str = "meetadev_ledger",
+    db: str = "appdb",
     collection: str = "transactions",
     estimated_docs: int = 40_000,
 ) -> dict[str, Any]:
@@ -898,7 +898,7 @@ def openai_with(reply: object) -> tuple[OpenAIProvider, FakeCalls]:
     return OpenAIProvider(api_key="k", model="gpt-5", timeout_seconds=60, client=client), calls
 
 
-CONTEXT: dict[str, Any] = {"topology": "target node-backup", "remediations": ["grow the oplog"]}
+CONTEXT: dict[str, Any] = {"topology": "target mongo-hidden", "remediations": ["grow the oplog"]}
 REQUEST = httpx2.Request("POST", "https://api.example.invalid/v1")
 
 

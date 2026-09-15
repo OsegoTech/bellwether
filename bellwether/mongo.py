@@ -35,8 +35,8 @@ nothing else; and the serving connection every other read uses is untouched.
 Whatever is not traffic-dependent — oplog stats, replica-set status, the list
 of databases — stays on the backup node.
 
-Identity is ``meetadev-ai`` (clusterMonitor@admin, read@local,
-read@meetadev_ledger). TLS material reaches ``MongoClient`` as keyword
+Identity is ``bellwether-reader`` (clusterMonitor@admin, read@local,
+read@appdb). TLS material reaches ``MongoClient`` as keyword
 arguments, never through the URI, and hostname verification is never disabled.
 """
 

@@ -27,23 +27,23 @@ from bellwether.mongo import NoReachableNode, ReadOnlyMongo
 from tests.fakes import (
     FALLBACKS,
     READ_URI,
-    SOUTHAFRICA,
+    MEMBER_3,
     TARGET,
-    UAE,
-    WESTEUROPE,
+    MEMBER_2,
+    MEMBER_1,
     FakeCluster,
 )
 
-DB = "meetadev_ledger"
-CERT = Path("/etc/bellwether/tls/meetadev-ai.combined.pem")
+DB = "appdb"
+CERT = Path("/etc/bellwether/tls/bellwether-reader.combined.pem")
 MEMBERS = [TARGET, *FALLBACKS]  # hidden backup first, then the voters
-PRIMARY = UAE  # where the application's queries run in these tests
+PRIMARY = MEMBER_2  # where the application's queries run in these tests
 TS = datetime(2026, 9, 14, 12, 0)  # pymongo returns naive UTC datetimes
 SINCE = datetime(2026, 9, 1)  # $indexStats accesses.since: metadata, may be carried
 FILTER_DATE = datetime(2026, 8, 17)  # a literal inside a query filter: must never be carried
 
 # Literals in the fixtures below that are unique strings: none may appear anywhere.
-UNIQUE_LITERALS = ("ACC-9931", "2026-08-17", "10.1.1.4", "ledger-api", "c0ffee", "2F1AB33C")
+UNIQUE_LITERALS = ("ACC-9931", "2026-08-17", "192.0.2.10", "ledger-api", "c0ffee", "2F1AB33C")
 # Literal values that are also substrings of field names ("posted" in "posted_at"):
 # they may not appear as a JSON string value.
 WORD_LITERALS = ("posted", "pending")
@@ -86,7 +86,7 @@ def find_doc(
         "responseLength": 21450,
         "protocol": "op_msg",
         "ts": TS,
-        "client": "10.1.1.4",
+        "client": "192.0.2.10",
         "appName": "ledger-api",
         "allUsers": [{"user": "ledger-api", "db": "$external"}],
         "user": "ledger-api@$external",
@@ -115,7 +115,7 @@ def aggregate_doc() -> dict[str, Any]:
         "millis": 950,
         "responseLength": 4200,
         "ts": TS,
-        "client": "10.1.1.4",
+        "client": "192.0.2.10",
     }
 
 
@@ -139,21 +139,21 @@ INDEX_STATS: list[dict[str, Any]] = [
     {
         "name": "_id_",
         "key": {"_id": 1},
-        "host": "node-backup.mongo.internal:27017",
+        "host": "mongo-hidden.example.internal:27017",
         "accesses": {"ops": Int64(912), "since": SINCE},
         "spec": {"v": 2, "key": {"_id": 1}, "name": "_id_"},
     },
     {
         "name": "account_id_1",
         "key": {"account_id": 1},
-        "host": "node-backup.mongo.internal:27017",
+        "host": "mongo-hidden.example.internal:27017",
         "accesses": {"ops": Int64(0), "since": SINCE},
         "spec": {"v": 2, "key": {"account_id": 1}, "name": "account_id_1"},
     },
     {
         "name": "status_1",
         "key": {"status": 1.0},
-        "host": "node-backup.mongo.internal:27017",
+        "host": "mongo-hidden.example.internal:27017",
         "accesses": {"ops": Int64(3), "since": SINCE},
         "spec": {
             "v": 2,
@@ -390,7 +390,7 @@ def test_unknown_profiling_status_still_reads_the_profiler() -> None:
     cluster = cluster_with()
 
     def unauthorized(node: str, doc: dict[str, Any]) -> dict[str, Any]:
-        raise OperationFailure("not authorized on meetadev_ledger to execute command", code=13)
+        raise OperationFailure("not authorized on appdb to execute command", code=13)
 
     cluster.commands[f"{DB}.profile"] = unauthorized
 
@@ -554,16 +554,16 @@ def test_sweep_only_ever_reads() -> None:
 
 def test_unreachable_member_is_reported_not_fatal(caplog: pytest.LogCaptureFixture) -> None:
     cluster = swept_cluster()
-    cluster.down.add(WESTEUROPE)
+    cluster.down.add(MEMBER_1)
 
     with caplog.at_level(logging.WARNING, logger="bellwether.collectors"):
         signals = sweep(cluster)
 
-    assert [s.node for s in signals] == [TARGET, UAE, SOUTHAFRICA]
+    assert [s.node for s in signals] == [TARGET, MEMBER_2, MEMBER_3]
     ev = evidence(signals[0])
-    assert ev["members_swept"] == [TARGET, UAE, SOUTHAFRICA]
-    assert ev["members_unreachable"] == [WESTEUROPE]
-    assert any(getattr(r, "node", None) == WESTEUROPE for r in caplog.records)
+    assert ev["members_swept"] == [TARGET, MEMBER_2, MEMBER_3]
+    assert ev["members_unreachable"] == [MEMBER_1]
+    assert any(getattr(r, "node", None) == MEMBER_1 for r in caplog.records)
 
 
 def test_sweep_with_no_reachable_member_raises() -> None:
@@ -603,11 +603,11 @@ def test_index_use_is_read_from_every_member() -> None:
     signals = sweep(swept_cluster(index_ops={PRIMARY: 5_000}))
 
     usage = {s.node: evidence(s)["index_stats"][0]["accesses_ops"] for s in signals}
-    assert usage == {TARGET: 0, WESTEUROPE: 0, UAE: 5_000, SOUTHAFRICA: 0}
+    assert usage == {TARGET: 0, MEMBER_1: 0, MEMBER_2: 5_000, MEMBER_3: 0}
 
 
 def test_slow_queries_on_any_member_bring_in_every_members_index_stats() -> None:
-    docs = {PRIMARY: [find_doc(coll="transactions")], SOUTHAFRICA: [find_doc(coll="accounts")]}
+    docs = {PRIMARY: [find_doc(coll="transactions")], MEMBER_3: [find_doc(coll="accounts")]}
 
     signals = sweep(swept_cluster(docs_by_node=docs))
 
@@ -622,12 +622,12 @@ def test_duplicate_members_are_swept_once() -> None:
         tls_ca_file=Path("/etc/mongodb/tls/ca-chain.cert.pem"),
         tls_cert_file=CERT,
         target_node=TARGET,
-        fallback_nodes=[WESTEUROPE, TARGET, WESTEUROPE],
+        fallback_nodes=[MEMBER_1, TARGET, MEMBER_1],
     )
 
     collector().collect_signals(ReadOnlyMongo(config, client_factory=cluster.factory()))
 
-    assert cluster.attempted_nodes == [TARGET, WESTEUROPE]
+    assert cluster.attempted_nodes == [TARGET, MEMBER_1]
 
 
 def test_sweep_logs_each_member_read(caplog: pytest.LogCaptureFixture) -> None:

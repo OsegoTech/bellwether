@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from bson import Timestamp
+from pymongo.errors import OperationFailure
 
 from bellwether.collectors.base import Collector
 from bellwether.collectors.oplog_window import OplogWindowCollector
@@ -22,7 +23,7 @@ from bellwether.detectors.base import Detector
 from bellwether.detectors.oplog_window import OplogWindowDetector
 from bellwether.models import Evidence, Finding, Severity, Signal, SignalClass
 from bellwether.mongo import ReadOnlyMongo
-from tests.fakes import FALLBACKS, READ_URI, TARGET, WESTEUROPE, FakeCluster
+from tests.fakes import FALLBACKS, READ_URI, TARGET, MEMBER_1, FakeCluster
 
 MIN = 60
 HOUR = 3600
@@ -90,7 +91,7 @@ def read_client(cluster: FakeCluster) -> ReadOnlyMongo:
     config = MongoConfig(
         uri=READ_URI,
         tls_ca_file=Path("/etc/mongodb/tls/ca-chain.cert.pem"),
-        tls_cert_file=Path("/etc/bellwether/tls/meetadev-ai.combined.pem"),
+        tls_cert_file=Path("/etc/bellwether/tls/bellwether-reader.combined.pem"),
         target_node=TARGET,
         fallback_nodes=FALLBACKS,
     )
@@ -164,14 +165,14 @@ def test_boundaries() -> None:
 
 
 def test_finding_carries_its_signal_and_node() -> None:
-    signal = oplog_signal(40 * MIN, node=WESTEUROPE)
+    signal = oplog_signal(40 * MIN, node=MEMBER_1)
 
     finding = detector().evaluate([signal])
 
     assert finding is not None
     assert finding.signals == (signal,)
-    assert finding.node == WESTEUROPE
-    assert WESTEUROPE in finding.summary
+    assert finding.node == MEMBER_1
+    assert MEMBER_1 in finding.summary
 
 
 def test_summary_is_deterministic() -> None:
@@ -322,6 +323,34 @@ def test_collector_returns_none_for_empty_oplog() -> None:
     ]
 
     assert OplogWindowCollector(sleep=Sleeps()).collect(read_client(cluster)) is None
+
+
+def test_a_standalone_without_an_oplog_yields_no_signal() -> None:
+    # A single instance (not a replica-set member) has no local.oplog.rs.
+    cluster = FakeCluster()
+
+    def no_oplog(node: str, ns: str, pipeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        raise OperationFailure(
+            "Unable to retrieve storageStats in $collStats stage :: caused by :: "
+            "Collection [local.oplog.rs] not found.",
+            code=26,
+        )
+
+    cluster.aggregations["$collStats"] = no_oplog
+
+    assert OplogWindowCollector(sleep=Sleeps()).collect(read_client(cluster)) is None
+
+
+def test_other_oplog_read_errors_still_raise() -> None:
+    cluster = FakeCluster()
+
+    def unauthorized(node: str, ns: str, pipeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        raise OperationFailure("not authorized on local", code=13)
+
+    cluster.aggregations["$collStats"] = unauthorized
+
+    with pytest.raises(OperationFailure):
+        OplogWindowCollector(sleep=Sleeps()).collect(read_client(cluster))
 
 
 def test_collector_to_detector_end_to_end() -> None:

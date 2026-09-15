@@ -79,7 +79,7 @@ def make_proposal(kind: ActionKind = ActionKind.PROPOSE_ONLY) -> Proposal:
             reversible=True,
             executor_op="create_small_index",
             executor_args={
-                "db": "meetadev_ledger",
+                "db": "appdb",
                 "collection": "transactions",
                 "keys": [{"field": "account_id", "direction": 1}],
                 "estimated_docs": 100,
@@ -96,7 +96,7 @@ def make_proposal(kind: ActionKind = ActionKind.PROPOSE_ONLY) -> Proposal:
     return Proposal(
         finding_id="f" * 32,
         failure_mode="oplog_window_below_resync",
-        node="node-backup.mongo.internal:27017",
+        node="mongo-hidden.example.internal:27017",
         diagnosis="Window 40 min < resync 60 min.",
         mechanism="Capped oplog.",
         impact_if_ignored="Initial sync after maintenance.",

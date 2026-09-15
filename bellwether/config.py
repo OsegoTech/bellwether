@@ -133,7 +133,7 @@ def _check_mongo_uri(uri: str, section: str, field: str) -> str:
 
 
 class MongoConfig(_Section):
-    """The read side. Identity ``meetadev-ai``; no write path exists here.
+    """The read side. Identity ``bellwether-reader``; no write path exists here.
 
     ``uri`` supplies auth options (X.509, $external, tls). The host in it is
     replaced per connection attempt by ``target_node`` then ``fallback_nodes``.
@@ -209,7 +209,7 @@ class StoreConfig(_Section):
 
 
 class ExecutorConfig(_Section):
-    """The write side. Identity ``meetadev-ai-exec``, reachable only past approval."""
+    """The write side. Identity ``bellwether-exec``, reachable only past approval."""
 
     enabled: bool = False
     mongo_uri: str | None = None
@@ -265,15 +265,15 @@ _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{2,}$")
 
 
 class ApprovalConfig(_Section):
-    """Who may decide from Slack.
+    """Who may decide, from Slack or the API decision endpoint.
 
     Slack user IDs, not display names: a name can be changed by its owner, an
     ID cannot. Empty means nobody — the approval endpoint fails closed.
     """
 
     approver_ids: list[str] = Field(default_factory=list)
-    # The in-UI approve/reject form. It also requires `bellwether serve` to be
-    # bound to a loopback host; both must hold. Slack approval is unaffected.
+    # POST /api/proposals/{id}/decision. It also requires `bellwether serve` to
+    # be bound to a loopback host; both must hold. Slack approval is unaffected.
     ui_approval_enabled: bool = True
 
     @field_validator("approver_ids")
@@ -392,7 +392,7 @@ class BellwetherConfig(BaseSettings):
         ):
             raise ValueError(
                 "executor.tls_cert_file must be the write identity's own cert "
-                "(meetadev-ai-exec), not the read identity's mongo.tls_cert_file"
+                "(bellwether-exec), not the read identity's mongo.tls_cert_file"
             )
         return self
 

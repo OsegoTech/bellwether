@@ -22,9 +22,9 @@ from pydantic import SecretStr
 from bellwether.config import MongoConfig
 from bellwether.detectors.base import OP_NODE_EVIDENCE, OPID_EVIDENCE, killable_op_evidence
 from bellwether.mongo import ForbiddenCommand, NoReachableNode, ReadOnlyMongo
-from tests.fakes import FALLBACKS, READ_URI, SOUTHAFRICA, TARGET, UAE, WESTEUROPE, FakeCluster
+from tests.fakes import FALLBACKS, READ_URI, MEMBER_3, TARGET, MEMBER_2, MEMBER_1, FakeCluster
 
-CERT = Path("/etc/bellwether/tls/meetadev-ai.combined.pem")
+CERT = Path("/etc/bellwether/tls/bellwether-reader.combined.pem")
 CA = Path("/etc/mongodb/tls/ca-chain.cert.pem")
 
 
@@ -71,22 +71,22 @@ def test_target_down_falls_back_to_first_fallback(cluster: FakeCluster) -> None:
 
     mongo.server_status()
 
-    assert cluster.attempted_nodes == [TARGET, WESTEUROPE]
-    assert mongo.served_by == WESTEUROPE
+    assert cluster.attempted_nodes == [TARGET, MEMBER_1]
+    assert mongo.served_by == MEMBER_1
 
 
 def test_fallback_order_is_followed(cluster: FakeCluster) -> None:
-    cluster.down.update({TARGET, WESTEUROPE})
+    cluster.down.update({TARGET, MEMBER_1})
     mongo = client_for(cluster)
 
     mongo.rs_status()
 
-    assert cluster.attempted_nodes == [TARGET, WESTEUROPE, UAE]
-    assert mongo.served_by == UAE
+    assert cluster.attempted_nodes == [TARGET, MEMBER_1, MEMBER_2]
+    assert mongo.served_by == MEMBER_2
 
 
 def test_unreachable_nodes_are_closed(cluster: FakeCluster) -> None:
-    cluster.down.update({TARGET, WESTEUROPE})
+    cluster.down.update({TARGET, MEMBER_1})
     client_for(cluster).rs_status()
 
     assert [c.closed for c in cluster.clients] == [True, True, False]
@@ -99,7 +99,7 @@ def test_all_nodes_down_raises_naming_every_node(cluster: FakeCluster) -> None:
     with pytest.raises(NoReachableNode) as excinfo:
         mongo.server_status()
 
-    assert cluster.attempted_nodes == [TARGET, WESTEUROPE, UAE, SOUTHAFRICA]
+    assert cluster.attempted_nodes == [TARGET, MEMBER_1, MEMBER_2, MEMBER_3]
     for node in (TARGET, *FALLBACKS):
         assert node in str(excinfo.value)
 
@@ -116,11 +116,11 @@ def test_target_failure_mid_session_fails_over_and_is_logged(
         reply = mongo.server_status()
 
     assert reply["ok"] == 1.0
-    assert mongo.served_by == WESTEUROPE
+    assert mongo.served_by == MEMBER_1
     fallback_logs = [r for r in caplog.records if getattr(r, "node", None) == TARGET]
     assert any(r.levelno == logging.WARNING for r in fallback_logs)
     served = [r for r in caplog.records if r.getMessage() == "read served"]
-    assert served and getattr(served[-1], "node") == WESTEUROPE
+    assert served and getattr(served[-1], "node") == MEMBER_1
 
 
 def test_every_read_logs_the_serving_node(
@@ -139,11 +139,11 @@ def test_every_read_logs_the_serving_node(
 
 def test_duplicate_nodes_are_tried_once(cluster: FakeCluster) -> None:
     cluster.down.add(TARGET)
-    mongo = client_for(cluster, fallback_nodes=[TARGET, UAE, UAE])
+    mongo = client_for(cluster, fallback_nodes=[TARGET, MEMBER_2, MEMBER_2])
 
     mongo.server_status()
 
-    assert cluster.attempted_nodes == [TARGET, UAE]
+    assert cluster.attempted_nodes == [TARGET, MEMBER_2]
 
 
 # --- Decision 6: TLS material as kwargs, never in the URI --------------------
@@ -184,7 +184,7 @@ def test_fallback_uri_swaps_only_the_host(cluster: FakeCluster) -> None:
     client_for(cluster).server_status()
 
     fallback_uri = cluster.clients[1].uri
-    assert fallback_uri == READ_URI.replace(TARGET, WESTEUROPE)
+    assert fallback_uri == READ_URI.replace(TARGET, MEMBER_1)
 
 
 def test_server_selection_timeout_comes_from_config(cluster: FakeCluster) -> None:
@@ -317,20 +317,20 @@ def test_current_op_uses_currentop_stage_with_filter(cluster: FakeCluster) -> No
 
 
 def test_profile_read_reads_system_profile(cluster: FakeCluster) -> None:
-    cluster.collections["meetadev_ledger.system.profile"] = [
+    cluster.collections["appdb.system.profile"] = [
         {"ts": 1, "millis": 5},
         {"ts": 3, "millis": 900},
         {"ts": 2, "millis": 40},
     ]
 
-    docs = client_for(cluster).profile_read("meetadev_ledger", limit=2)
+    docs = client_for(cluster).profile_read("appdb", limit=2)
 
     assert [d["ts"] for d in docs] == [3, 2]  # newest first, limited
 
 
 def test_profile_read_rejects_unbounded_limit(cluster: FakeCluster) -> None:
     with pytest.raises(ValueError):
-        client_for(cluster).profile_read("meetadev_ledger", limit=0)
+        client_for(cluster).profile_read("appdb", limit=0)
 
 
 def test_index_stats(cluster: FakeCluster) -> None:
@@ -338,9 +338,9 @@ def test_index_stats(cluster: FakeCluster) -> None:
         {"name": "_id_", "ns": ns, "accesses": {"ops": 10}}
     ]
 
-    stats = client_for(cluster).index_stats("meetadev_ledger", "transactions")
+    stats = client_for(cluster).index_stats("appdb", "transactions")
 
-    assert stats[0]["ns"] == "meetadev_ledger.transactions"
+    assert stats[0]["ns"] == "appdb.transactions"
 
 
 def test_close_closes_the_client(cluster: FakeCluster) -> None:
@@ -360,13 +360,13 @@ def test_profiling_status_reads_the_level_and_never_sets_it(cluster: FakeCluster
         sent.append(doc)
         return {"was": 1, "slowms": 100, "sampleRate": 1.0, "ok": 1.0}
 
-    cluster.commands["meetadev_ledger.profile"] = profile
+    cluster.commands["appdb.profile"] = profile
 
-    status = client_for(cluster).profiling_status("meetadev_ledger")
+    status = client_for(cluster).profiling_status("appdb")
 
     assert (status.level, status.slow_ms, status.sample_rate) == (1, 100, 1.0)
     assert sent == [{"profile": -1}]
-    assert cluster.commands_sent("profile")[0].db == "meetadev_ledger"
+    assert cluster.commands_sent("profile")[0].db == "appdb"
 
 
 def test_collection_stats(cluster: FakeCluster) -> None:
@@ -374,7 +374,7 @@ def test_collection_stats(cluster: FakeCluster) -> None:
         {"ns": ns, "storageStats": {"count": 2_400_000, "avgObjSize": 436, "size": 1_046_400_000}}
     ]
 
-    stats = client_for(cluster).collection_stats("meetadev_ledger", "transactions")
+    stats = client_for(cluster).collection_stats("appdb", "transactions")
 
     assert (stats.count, stats.avg_obj_size, stats.size_bytes) == (2_400_000, 436.0, 1_046_400_000)
 
@@ -384,7 +384,7 @@ def test_collection_stats_of_an_empty_collection(cluster: FakeCluster) -> None:
         {"ns": ns, "storageStats": {"count": 0, "size": 0}}
     ]
 
-    stats = client_for(cluster).collection_stats("meetadev_ledger", "empty")
+    stats = client_for(cluster).collection_stats("appdb", "empty")
 
     assert (stats.count, stats.avg_obj_size) == (0, None)
 
@@ -393,9 +393,9 @@ def test_collection_stats_of_an_empty_collection(cluster: FakeCluster) -> None:
 
 
 def test_members_lists_the_target_then_fallbacks_once(cluster: FakeCluster) -> None:
-    mongo = client_for(cluster, fallback_nodes=[WESTEUROPE, TARGET, UAE])
+    mongo = client_for(cluster, fallback_nodes=[MEMBER_1, TARGET, MEMBER_2])
 
-    assert mongo.members() == [TARGET, WESTEUROPE, UAE]
+    assert mongo.members() == [TARGET, MEMBER_1, MEMBER_2]
 
 
 def test_member_reader_is_pinned_to_one_member(cluster: FakeCluster) -> None:
@@ -409,14 +409,14 @@ def test_member_reader_is_pinned_to_one_member(cluster: FakeCluster) -> None:
 
 
 def test_member_reader_uses_the_read_identity_directly(cluster: FakeCluster) -> None:
-    reader = client_for(cluster).member_reader(UAE)
+    reader = client_for(cluster).member_reader(MEMBER_2)
 
     reader.rs_status()
 
     [client] = cluster.clients
     assert isinstance(reader, ReadOnlyMongo)  # the same read-only surface, nothing more
-    assert reader.served_by == UAE
-    assert client.uri == READ_URI.replace(TARGET, UAE)
+    assert reader.served_by == MEMBER_2
+    assert client.uri == READ_URI.replace(TARGET, MEMBER_2)
     assert client.kwargs["directConnection"] is True
     assert client.kwargs["tlsCertificateKeyFile"] == str(CERT)
     reader.close()
@@ -430,7 +430,7 @@ def test_member_reader_refuses_hosts_outside_the_config(cluster: FakeCluster) ->
 
 # --- The one exception: cluster-wide currentOp ---------------------------------------
 
-MEMBERS = [TARGET, WESTEUROPE, UAE, SOUTHAFRICA]  # backup (default target) first, then voters
+MEMBERS = [TARGET, MEMBER_1, MEMBER_2, MEMBER_3]  # backup (default target) first, then voters
 
 
 def sweep_cluster(
@@ -452,7 +452,7 @@ def test_current_op_all_nodes_reads_every_member_and_tags_the_node() -> None:
     cluster, seen = sweep_cluster(
         {
             TARGET: [{"opid": 11, "op": "query"}],
-            UAE: [{"opid": 4242, "secs_running": 900}, {"opid": 4243}],
+            MEMBER_2: [{"opid": 4242, "secs_running": 900}, {"opid": 4243}],
         }
     )
 
@@ -461,7 +461,7 @@ def test_current_op_all_nodes_reads_every_member_and_tags_the_node() -> None:
     assert [node for node, _ in seen] == MEMBERS
     assert result.nodes_read == tuple(MEMBERS)
     assert result.unreachable == {}
-    assert [(op.node, op.opid) for op in result.ops] == [(TARGET, 11), (UAE, 4242), (UAE, 4243)]
+    assert [(op.node, op.opid) for op in result.ops] == [(TARGET, 11), (MEMBER_2, 4242), (MEMBER_2, 4243)]
     assert result.ops[1].op["secs_running"] == 900
 
 
@@ -474,13 +474,13 @@ def test_sweep_connections_are_direct_read_identity_and_closed() -> None:
     for client, node in zip(cluster.clients, MEMBERS):
         assert client.uri == READ_URI.replace(TARGET, node)
         assert client.kwargs["directConnection"] is True
-        assert client.kwargs["tlsCertificateKeyFile"] == str(CERT)  # meetadev-ai, the read identity
+        assert client.kwargs["tlsCertificateKeyFile"] == str(CERT)  # bellwether-reader, the read identity
         assert "tlsCertificateKeyFile" not in client.uri
         assert client.closed
 
 
 def test_sweep_only_ever_runs_currentop() -> None:
-    cluster, seen = sweep_cluster({UAE: [{"opid": 1}]})
+    cluster, seen = sweep_cluster({MEMBER_2: [{"opid": 1}]})
 
     client_for(cluster).current_op_all_nodes({"secs_running": {"$gte": 60}})
 
@@ -491,15 +491,15 @@ def test_sweep_only_ever_runs_currentop() -> None:
 
 
 def test_unreachable_member_is_reported_not_fatal() -> None:
-    cluster, _ = sweep_cluster({WESTEUROPE: [{"opid": 7}]})
-    cluster.down.add(UAE)
+    cluster, _ = sweep_cluster({MEMBER_1: [{"opid": 7}]})
+    cluster.down.add(MEMBER_2)
 
     result = client_for(cluster).current_op_all_nodes()
 
-    assert set(result.unreachable) == {UAE}
-    assert "ServerSelectionTimeoutError" in result.unreachable[UAE]
-    assert result.nodes_read == (TARGET, WESTEUROPE, SOUTHAFRICA)
-    assert [(op.node, op.opid) for op in result.ops] == [(WESTEUROPE, 7)]
+    assert set(result.unreachable) == {MEMBER_2}
+    assert "ServerSelectionTimeoutError" in result.unreachable[MEMBER_2]
+    assert result.nodes_read == (TARGET, MEMBER_1, MEMBER_3)
+    assert [(op.node, op.opid) for op in result.ops] == [(MEMBER_1, 7)]
 
 
 def test_sweep_with_no_reachable_member_raises() -> None:
@@ -546,26 +546,26 @@ def test_sweep_logs_each_member_read(caplog: pytest.LogCaptureFixture) -> None:
 def test_duplicate_members_are_swept_once() -> None:
     cluster, _ = sweep_cluster({})
 
-    client_for(cluster, fallback_nodes=[WESTEUROPE, TARGET, WESTEUROPE]).current_op_all_nodes()
+    client_for(cluster, fallback_nodes=[MEMBER_1, TARGET, MEMBER_1]).current_op_all_nodes()
 
-    assert cluster.attempted_nodes == [TARGET, WESTEUROPE]
+    assert cluster.attempted_nodes == [TARGET, MEMBER_1]
 
 
 def test_non_integer_opid_is_not_killable() -> None:
-    cluster, _ = sweep_cluster({UAE: [{"opid": "shard01:4242"}, {"desc": "no opid"}]})
+    cluster, _ = sweep_cluster({MEMBER_2: [{"opid": "shard01:4242"}, {"desc": "no opid"}]})
 
     ops = client_for(cluster).current_op_all_nodes().ops
 
     assert [op.opid for op in ops] == [None, None]
-    assert [op.node for op in ops] == [UAE, UAE]
+    assert [op.node for op in ops] == [MEMBER_2, MEMBER_2]
 
 
 def test_node_op_feeds_killable_op_evidence() -> None:
-    cluster, _ = sweep_cluster({SOUTHAFRICA: [{"opid": 777, "secs_running": 1200}]})
+    cluster, _ = sweep_cluster({MEMBER_3: [{"opid": 777, "secs_running": 1200}]})
 
     [op] = client_for(cluster).current_op_all_nodes().ops
     assert op.opid is not None
     opid_evidence, node_evidence = killable_op_evidence(op.opid, op.node)
 
     assert (opid_evidence.name, opid_evidence.value) == (OPID_EVIDENCE, 777)
-    assert (node_evidence.name, node_evidence.value) == (OP_NODE_EVIDENCE, SOUTHAFRICA)
+    assert (node_evidence.name, node_evidence.value) == (OP_NODE_EVIDENCE, MEMBER_3)

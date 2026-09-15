@@ -39,19 +39,19 @@ from bellwether.store.sqlite import SqliteStore
 from tests.fakes import FALLBACKS, READ_URI, FakeCluster
 
 T0 = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
-WESTEUROPE = "node-westeurope.mongo.internal:27017"
-UAE = "node-uae.mongo.internal:27017"
-SOUTHAFRICA = "node-southafrica.mongo.internal:27017"
-BACKUP = "node-backup.mongo.internal:27017"
+MEMBER_1 = "mongo-1.example.internal:27017"
+MEMBER_2 = "mongo-2.example.internal:27017"
+MEMBER_3 = "mongo-3.example.internal:27017"
+BACKUP = "mongo-hidden.example.internal:27017"
 EXEC_URI = (
-    f"mongodb://{WESTEUROPE},{UAE},{SOUTHAFRICA}/"
+    f"mongodb://{MEMBER_1},{MEMBER_2},{MEMBER_3}/"
     "?replicaSet=rs0&authMechanism=MONGODB-X509&authSource=%24external&tls=true"
 )
-EXEC_CERT = Path("/etc/bellwether/tls/meetadev-ai-exec.combined.pem")
+EXEC_CERT = Path("/etc/bellwether/tls/bellwether-exec.combined.pem")
 CA = Path("/etc/mongodb/tls/ca-chain.cert.pem")
 
 INDEX_ARGS: dict[str, Any] = {
-    "db": "meetadev_ledger",
+    "db": "appdb",
     "collection": "transactions",
     "keys": [{"field": "account_id", "direction": 1}, {"field": "posted_at", "direction": -1}],
     "estimated_docs": 40_000,
@@ -148,7 +148,7 @@ def index_proposal(**arg_overrides: Any) -> Proposal:
     return Proposal(
         finding_id="f" * 32,
         failure_mode="unindexed_hot_query",
-        node="node-backup.mongo.internal:27017",
+        node="mongo-hidden.example.internal:27017",
         diagnosis="Collection scans on transactions.account_id.",
         mechanism="No index covers the filter.",
         impact_if_ignored="Latency grows with the collection.",
@@ -171,8 +171,8 @@ def kill_proposal(
     opid: object = 4242,
     identified: tuple[int, ...] = (4242,),
     *,
-    op_node: str | None = UAE,
-    node: str = UAE,
+    op_node: str | None = MEMBER_2,
+    node: str = MEMBER_2,
 ) -> Proposal:
     evidence = tuple(Evidence(OPID_EVIDENCE, o, observed_at=T0) for o in identified)
     if op_node is not None:
@@ -287,7 +287,7 @@ def test_approved_index_calls_create_small_index_with_validated_args(
 
     assert world.indexes == [
         (
-            "meetadev_ledger.transactions",
+            "appdb.transactions",
             [("account_id", 1), ("posted_at", -1)],
             {"background": True},
         )
@@ -553,7 +553,7 @@ def test_index_creation_routes_via_replica_set_uri(store: SqliteStore, world: Fa
     [client] = world.clients
     assert client.uri == EXEC_URI
     assert "replicaSet=rs0" in client.uri
-    for node in (WESTEUROPE, UAE, SOUTHAFRICA):
+    for node in (MEMBER_1, MEMBER_2, MEMBER_3):
         assert node in client.uri
     assert client.kwargs["directConnection"] is False  # the driver finds the primary
     assert world.indexes and world.commands == []
@@ -562,12 +562,12 @@ def test_index_creation_routes_via_replica_set_uri(store: SqliteStore, world: Fa
 def test_kill_op_connects_directly_to_the_findings_node(
     store: SqliteStore, world: FakeWorld
 ) -> None:
-    proposal = kill_proposal(op_node=SOUTHAFRICA, node=SOUTHAFRICA)
+    proposal = kill_proposal(op_node=MEMBER_3, node=MEMBER_3)
 
     result = make_executor(store, world).execute(proposal, approved(store, proposal))
 
     [client] = world.clients
-    assert client.uri.startswith(f"mongodb://{SOUTHAFRICA}/?")
+    assert client.uri.startswith(f"mongodb://{MEMBER_3}/?")
     assert "replicaSet" not in client.uri
     assert "authMechanism=MONGODB-X509" in client.uri
     assert "authSource=%24external" in client.uri
@@ -612,7 +612,7 @@ def test_kill_op_on_an_unknown_host_is_refused(store: SqliteStore, world: FakeWo
 
 
 def test_kill_op_node_must_match_the_finding(store: SqliteStore, world: FakeWorld) -> None:
-    proposal = kill_proposal(op_node=UAE, node=SOUTHAFRICA)
+    proposal = kill_proposal(op_node=MEMBER_2, node=MEMBER_3)
     record = approved(store, proposal)
 
     with pytest.raises(ActionRefused, match="disagrees"):
@@ -627,20 +627,20 @@ def test_connections_are_reused_per_target(store: SqliteStore, world: FakeWorld)
         executor.execute(proposal, approved(store, proposal))
 
     uris = [c.uri for c in world.clients]
-    assert len(uris) == 2  # one replica-set client, one direct client to node-uae
-    assert uris[0] == EXEC_URI and uris[1].startswith(f"mongodb://{UAE}/?")
+    assert len(uris) == 2  # one replica-set client, one direct client to mongo-2
+    assert uris[0] == EXEC_URI and uris[1].startswith(f"mongodb://{MEMBER_2}/?")
 
 
 def test_killable_op_evidence_is_what_the_executor_reads(
     store: SqliteStore, world: FakeWorld
 ) -> None:
     base = kill_proposal()
-    proposal = replace(base, evidence_refs=killable_op_evidence(4242, UAE))
+    proposal = replace(base, evidence_refs=killable_op_evidence(4242, MEMBER_2))
 
     result = make_executor(store, world).execute(proposal, approved(store, proposal))
 
     assert result.state is ApprovalState.EXECUTED
-    assert world.clients[0].uri.startswith(f"mongodb://{UAE}/?")
+    assert world.clients[0].uri.startswith(f"mongodb://{MEMBER_2}/?")
 
 
 def test_cluster_sweep_feeds_kill_op_to_the_node_the_op_runs_on(
@@ -649,13 +649,13 @@ def test_cluster_sweep_feeds_kill_op_to_the_node_the_op_runs_on(
     # Read side: find the op where it runs. Write side: kill it there.
     cluster = FakeCluster()
     cluster.aggregations["$currentOp"] = lambda node, ns, pipeline: (
-        [{"opid": 777, "secs_running": 1200}] if node == SOUTHAFRICA else []
+        [{"opid": 777, "secs_running": 1200}] if node == MEMBER_3 else []
     )
     reader = ReadOnlyMongo(
         MongoConfig(
             uri=READ_URI,
             tls_ca_file=CA,
-            tls_cert_file=Path("/etc/bellwether/tls/meetadev-ai.combined.pem"),
+            tls_cert_file=Path("/etc/bellwether/tls/bellwether-reader.combined.pem"),
             target_node=BACKUP,
             fallback_nodes=FALLBACKS,
         ),
@@ -668,7 +668,7 @@ def test_cluster_sweep_feeds_kill_op_to_the_node_the_op_runs_on(
 
     make_executor(store, world).execute(proposal, approved(store, proposal))
 
-    assert world.clients[0].uri.startswith(f"mongodb://{SOUTHAFRICA}/?")
+    assert world.clients[0].uri.startswith(f"mongodb://{MEMBER_3}/?")
     assert world.commands == [("admin", {"killOp": 1, "op": 777})]
 
 

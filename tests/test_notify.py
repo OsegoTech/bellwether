@@ -40,7 +40,7 @@ def make_proposal(**overrides: Any) -> Proposal:
     values: dict[str, Any] = {
         "finding_id": "a" * 32,
         "failure_mode": "oplog_window_below_resync",
-        "node": "node-backup.mongo.internal:27017",
+        "node": "mongo-hidden.example.internal:27017",
         "diagnosis": "The oplog holds 40 min against a 60 min resync estimate.",
         "mechanism": "local.oplog.rs is capped; a burst of writes truncated history.",
         "impact_if_ignored": "A secondary down for maintenance needs a full initial sync.",
@@ -52,7 +52,7 @@ def make_proposal(**overrides: Any) -> Proposal:
             reversible=True,
             executor_op="create_small_index",
             executor_args={
-                "db": "meetadev_ledger",
+                "db": "appdb",
                 "collection": "transactions",
                 "keys": [{"field": "account_id", "direction": 1}],
                 "estimated_docs": 40000,

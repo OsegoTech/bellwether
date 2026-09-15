@@ -28,31 +28,32 @@ component with its own identity, reachable only through the approval flow.
 
 ---
 
-## 1. Grounding — the real cluster Bellwether connects to
+## 1. Grounding — the reference deployment
 
-These are not placeholders. Build against them.
+The topology Bellwether was built against. Hostnames, addresses and names are
+example values (RFC 2606 names, RFC 5737 addresses); substitute your own.
 
 | Thing | Value |
 |---|---|
 | Replica set | `rs0` |
-| Voting nodes | `node-uae.mongo.internal:27017` (10.1.1.4), `node-southafrica.mongo.internal:27017` (10.2.1.4), `node-westeurope.mongo.internal:27017` (10.3.1.4) |
-| Hidden backup node (collector target) | `node-backup.mongo.internal:27017` (10.3.2.5) — non-voting, priority 0, hidden |
-| Monitoring VM | `vm-monitoring` 10.3.2.4, public 20.86.152.132 |
-| Prometheus | v3.12.0 on the monitoring VM, 30-day retention, `http://10.3.2.4:9090` |
+| Voting nodes | `mongo-2.example.internal:27017` (192.0.2.10), `mongo-3.example.internal:27017` (192.0.2.11), `mongo-1.example.internal:27017` (192.0.2.12) |
+| Hidden backup node (collector target) | `mongo-hidden.example.internal:27017` (192.0.2.13) — non-voting, priority 0, hidden |
+| Monitoring VM | `monitoring-host` 192.0.2.14, public 198.51.100.20 |
+| Prometheus | v3.12.0 on the monitoring VM, 30-day retention, `http://prometheus.example.internal:9090` |
 | CA chain | `/etc/mongodb/tls/ca-chain.cert.pem` |
 | Auth | MongoDB-X509 over mutual TLS, `authSource=$external` |
-| Ledger DB | `meetadev_ledger`, collection `transactions` (double-entry, `$jsonSchema` validated) |
+| Ledger DB | `appdb`, collection `transactions` (double-entry, `$jsonSchema` validated) |
 
-**Bellwether's identity: `meetadev-ai`**
-- DN: `CN=meetadev-ai,OU=cluster-clients,O=Meetadev,DC=internal,DC=mongo`
-- Roles: `clusterMonitor@admin`, `read@local`, `read@meetadev_ledger`
+**Bellwether's identity: `bellwether-reader`**
+- DN: `CN=bellwether-reader,OU=cluster-clients,O=Example,DC=example,DC=internal`
+- Roles: `clusterMonitor@admin`, `read@local`, `read@appdb`
 - Created via the **useradmin** identity (separation of duties — creating users is
   userAdmin's job, not clusterAdmin's), consistent with how Part 8 extended the
   monitor identity for the exporter.
-- The `read@meetadev_ledger` grant exists solely so collectors can read
+- The `read@appdb` grant exists solely so collectors can read
   `system.profile` in that DB. This is a real widening and the article names it:
   profiler access implies document-read access on that DB. The mitigation is that
-  `meetadev-ai` is a dedicated identity, used only by Bellwether, and its use is
+  `bellwether-reader` is a dedicated identity, used only by Bellwether, and its use is
   audited.
 
 **Gotchas inherited from the series:**
@@ -243,7 +244,7 @@ validation:
 Any op not in the whitelist raises `ActionNotWhitelisted`.
 
 `executor.py` — holds a **separate** write-capable MongoDB identity
-(`meetadev-ai-exec`, distinct from the read `meetadev-ai`), used only here.
+(`bellwether-exec`, distinct from the read `bellwether-reader`), used only here.
 `execute(proposal, approval_record)`:
 - refuses unless `approval_record.state == APPROVED`
 - refuses unless `proposal.action.kind == EXECUTABLE`
@@ -305,7 +306,7 @@ finding produces a stored proposal and a stdout notification, and records a run.
 
 - The AI prompt wording (marked TODO; refined in design).
 - The two executor actions (fixed: kill_op, create_small_index — no additions).
-- The identity model (fixed: read `meetadev-ai`, write `meetadev-ai-exec`).
+- The identity model (fixed: read `bellwether-reader`, write `bellwether-exec`).
 - Adding any agent framework, LangChain, LiteLLM, or motor.
 - Widening the executor whitelist for convenience.
 

@@ -1,6 +1,6 @@
 """The executor — the only write-capable component (BUILD_SPEC §3.8).
 
-Holds the write identity ``meetadev-ai-exec`` (its own cert, from the
+Holds the write identity ``bellwether-exec`` (its own cert, from the
 ``executor`` config section), used nowhere else and reached only past
 approval. ``execute`` refuses unless:
 
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 Doc = dict[str, Any]
 
-WRITE_IDENTITY = "meetadev-ai-exec"
+WRITE_IDENTITY = "bellwether-exec"
 
 
 class ExecutionRefused(Exception):

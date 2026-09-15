@@ -1,7 +1,9 @@
 [project]
 name = "bellwether"
 version = "0.1.0"
-description = "Predictive reliability service for self-hosted MongoDB replica sets"
+description = "Predictive and advisory reliability service for self-hosted MongoDB replica sets"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.60",
