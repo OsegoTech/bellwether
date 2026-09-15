@@ -31,6 +31,12 @@ has zero accesses on *every* member, every member's counters have run long
 enough (the youngest decides), and no member was unreachable: an index busy
 on the primary is not unused because the backup never touched it.
 
+**Profiler levels are written into findings as text** (``profiler_level_text``):
+an unreadable level — the read identity lacks enableProfiler, which only
+dbAdmin grants — becomes "unknown (not readable without dbAdmin; not
+necessarily off)", never a bare None that reads as "off"; a real 0 is "off".
+Detection itself still uses the raw level from each signal.
+
 An existing index **supports** a shape when its leading fields are the
 candidate's equality fields (any order, any direction), then its sort fields
 in order (directions as given or all reversed), then its range fields — i.e.
@@ -66,6 +72,25 @@ logger = logging.getLogger(__name__)
 PROFILER_DISABLED = "profiler_disabled"
 MISSING_INDEX_COLLSCAN = "missing_index_collscan"
 REDUNDANT_INDEX = "redundant_index"
+
+# How a profiler level is written into findings — what the analysis stage, and
+# every human reading a proposal, sees. An unreadable level (the accepted
+# enableProfiler/dbAdmin blind spot) must never read as "off".
+PROFILER_LEVEL_UNKNOWN = "unknown (not readable without dbAdmin; not necessarily off)"
+PROFILER_LEVEL_TEXT = {
+    0: "off (level 0: profiling disabled)",
+    1: "on (level 1: operations slower than slowms)",
+    2: "on (level 2: all operations)",
+}
+
+
+def profiler_level_text(level: Any) -> str:
+    """A self-explaining rendering of a profiler level for evidence."""
+    if level is None:
+        return PROFILER_LEVEL_UNKNOWN
+    if isinstance(level, int) and not isinstance(level, bool):
+        return PROFILER_LEVEL_TEXT.get(level, f"level {level}")
+    return f"level {level}"
 
 
 @dataclass(frozen=True)
@@ -162,7 +187,7 @@ class IndexAdvisorDetector(Detector):
             evidence=(
                 Evidence("db", db),
                 Evidence("subject", db),
-                Evidence("profiler_level", 0),
+                Evidence("profiler_level", profiler_level_text(0)),
                 Evidence("slow_ms", slow_ms, "ms"),
             ),
             signals=(signal,),
@@ -237,7 +262,10 @@ class IndexAdvisorDetector(Detector):
             Evidence("collection_doc_count", view.doc_count, "docs"),
             Evidence("members", list(view.nodes)),
             Evidence("members_unreachable", list(view.unreachable)),
-            Evidence("profiler_levels", view.profiler_levels),
+            Evidence(
+                "profiler_levels",
+                {node: profiler_level_text(level) for node, level in view.profiler_levels.items()},
+            ),
             Evidence("slow_ms", view.slow_ms, "ms"),
         ]
         if candidate.dropped:

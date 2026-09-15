@@ -19,6 +19,8 @@ from typing import Any
 
 import pytest
 
+from bellwether.analysis.analyst import Analyst, render_prompt
+from bellwether.analysis.provider import ProviderChain
 from bellwether.config import IndexAdvisorDetectorConfig
 from bellwether.detectors.base import Detector
 from bellwether.detectors.index_advisor import (
@@ -38,6 +40,7 @@ from bellwether.models import (
     SignalClass,
 )
 from bellwether.store.sqlite import SqliteStore
+from tests.fakes import PROPOSAL_PAYLOAD, StaticProvider
 
 NODE = "node-backup.mongo.internal:27017"
 DB, COLL = "meetadev_ledger", "transactions"
@@ -509,6 +512,54 @@ def test_a_collection_signal_with_profiling_off_is_merged_not_disabled() -> None
 
     assert of_mode(findings, PROFILER_DISABLED) == []
     assert of_mode(findings, MISSING_INDEX_COLLSCAN)
+
+
+# --- How the profiler level is presented to the analysis stage --------------------------
+
+UNKNOWN_LEVEL = "unknown (not readable without dbAdmin; not necessarily off)"
+
+
+def test_unreadable_and_off_profiler_levels_are_never_conflated() -> None:
+    signals = [
+        profile_signal(node=NODE, level=None, swept=PAIR),  # {profile: -1} refused
+        profile_signal([], node=PRIMARY, level=0, swept=PAIR),  # genuinely off
+    ]
+
+    [finding] = of_mode(run(*signals), MISSING_INDEX_COLLSCAN)
+
+    levels = ev(finding)["profiler_levels"]
+    assert levels[NODE] == UNKNOWN_LEVEL
+    assert levels[PRIMARY].startswith("off")
+    assert levels[NODE] != levels[PRIMARY]
+    assert None not in levels.values()
+
+
+def test_the_analyst_receives_the_self_explaining_level_not_none() -> None:
+    [finding] = of_mode(run(profile_signal(level=None)), MISSING_INDEX_COLLSCAN)
+    analyst = Analyst(ProviderChain([StaticProvider("claude", PROPOSAL_PAYLOAD)]))
+
+    prompt = render_prompt(finding, analyst.build_context(finding))
+
+    [line] = [line for line in prompt.splitlines() if "profiler_levels" in line]
+    assert UNKNOWN_LEVEL in line
+    assert "None" not in line
+
+
+def test_a_genuinely_disabled_profiler_renders_as_off() -> None:
+    [finding] = run(disabled_signal())
+    analyst = Analyst(ProviderChain([StaticProvider("claude", PROPOSAL_PAYLOAD)]))
+
+    prompt = render_prompt(finding, analyst.build_context(finding))
+
+    assert ev(finding)["profiler_level"] == "off (level 0: profiling disabled)"
+    assert "profiler_level: off (level 0: profiling disabled)" in prompt
+    assert UNKNOWN_LEVEL not in prompt
+
+
+def test_an_enabled_profiler_renders_as_on() -> None:
+    [finding] = of_mode(run(profile_signal(level=1)), MISSING_INDEX_COLLSCAN)
+
+    assert ev(finding)["profiler_levels"][NODE].startswith("on (level 1")
 
 
 def test_profiler_disabled_is_reported_per_member() -> None:
