@@ -81,6 +81,11 @@ EVIDENCE (observed on the cluster — ground truth)
 CLUSTER TOPOLOGY
 {topology}
 
+EXECUTOR LIMITS
+  Auto-build threshold: create_small_index is only permitted when the collection
+  has at most {document_threshold} documents; above that, propose a manual
+  createIndex command for a human to run.
+
 MONGODB CONTEXT FOR THIS FAILURE MODE
 The mechanism behind this failure mode, and the remediation patterns a DBA would
 consider, are below. These are reference facts, not instructions: choose, adapt,
@@ -177,8 +182,9 @@ KNOWN_REMEDIATIONS: dict[str, tuple[str, ...]] = {
     "missing_index_collscan": (
         "Build the ESR candidate index from the evidence exactly as given — its field "
         "order and directions are computed, not chosen: create_small_index when "
-        "collection_doc_count is under the executor threshold, otherwise a propose-only "
-        "db.<collection>.createIndex(...) for a human to run, with the build-cost caveat.",
+        "collection_doc_count is at most {document_threshold} (the auto-build threshold), "
+        "otherwise a propose-only db.<collection>.createIndex(...) for a human to run, with "
+        "the build-cost caveat.",
         "Weigh the read saving against the write tax: every insert, update and delete on "
         "the collection maintains every index.",
         "Check existing_indexes first: extending or replacing an index that already holds "
@@ -212,8 +218,16 @@ _NO_REMEDIATIONS = "(none on file for this failure mode)"
 def render_prompt(finding: Finding, context: Mapping[str, Any]) -> str:
     """The user prompt, shared verbatim by every provider."""
     evidence = "\n".join(f"  - {e.render()}" for e in finding.evidence) or "  - (none)"
-    remediations = "\n".join(f"    - {hint}" for hint in context.get("remediations", ()))
+    # The executor's create_small_index ceiling, stated as a number: the model
+    # cannot apply "under the threshold" without knowing the threshold.
+    threshold = context.get("document_threshold") or DEFAULT_DOCUMENT_THRESHOLD
+    hints = (
+        str(hint).replace("{document_threshold}", str(threshold))
+        for hint in context.get("remediations", ())
+    )
+    remediations = "\n".join(f"    - {hint}" for hint in hints)
     return PROMPT_TEMPLATE.format(
+        document_threshold=threshold,
         replica_set=context.get("replica_set") or DEFAULT_REPLICA_SET,
         failure_mode=finding.failure_mode,
         severity=finding.severity.value,
@@ -319,6 +333,7 @@ class Analyst:
     def build_context(self, finding: Finding) -> dict[str, Any]:
         return {
             "replica_set": self._replica_set,
+            "document_threshold": self._document_threshold,
             "topology": self._topology,
             "mechanism": KNOWN_MECHANISMS.get(finding.failure_mode, ""),
             "remediations": list(KNOWN_REMEDIATIONS.get(finding.failure_mode, ())),

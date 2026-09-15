@@ -454,7 +454,13 @@ def test_context_is_bounded(finding: Finding) -> None:
     analyst, claude, _ = analyst_with([VALID], [VALID])
     analyst.analyze(finding)
 
-    assert set(claude.contexts[0]) == {"topology", "remediations", "mechanism", "replica_set"}
+    assert set(claude.contexts[0]) == {
+        "topology",
+        "remediations",
+        "mechanism",
+        "replica_set",
+        "document_threshold",
+    }
 
 
 def test_unknown_failure_mode_still_renders(finding: Finding) -> None:
@@ -770,6 +776,68 @@ def test_create_small_index_needs_an_index_finding(finding: Finding) -> None:
 
     with pytest.raises(AnalysisUnavailable, match="candidate_index"):
         analyst.analyze(finding)
+
+
+# --- The auto-build threshold is stated, not guessed -----------------------------------------
+
+THRESHOLD_LINE = (
+    "Auto-build threshold: create_small_index is only permitted when the collection has "
+    "at most {n} documents; above that, propose a manual createIndex command for a human "
+    "to run."
+)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+@pytest.mark.parametrize("threshold", [100_000, 12_345])
+def test_the_prompt_states_the_actual_auto_build_threshold(threshold: int) -> None:
+    finding = index_finding(count=300_012)
+    analyst = Analyst(
+        ProviderChain([ScriptedProvider("claude", [VALID])]), document_threshold=threshold
+    )
+
+    prompt = render_prompt(finding, analyst.build_context(finding))
+
+    assert THRESHOLD_LINE.format(n=threshold) in _one_line(prompt)
+    remediation = _one_line(
+        next(line for line in prompt.splitlines() if "create_small_index when" in line)
+    )
+    assert str(threshold) in remediation  # the guidance and the stated number agree
+    assert "{document_threshold}" not in prompt
+
+
+def test_over_threshold_a_propose_only_create_index_is_accepted_and_was_prompted() -> None:
+    big = index_finding(count=300_012)  # over the 100,000-document executor threshold
+    manual: dict[str, Any] = {
+        **VALID,
+        "action": {
+            "kind": "propose_only",
+            "title": "Build the ESR candidate index by hand, off-peak",
+            "command": "db.transactions.createIndex({ account_id: 1, status: 1, posted_at: -1 })",
+            "rationale": "300,012 documents is over the auto-build threshold of 100000.",
+            "reversible": True,
+            "executor_op": None,
+            "executor_args": None,
+        },
+    }
+    claude = ScriptedProvider("claude", [manual])
+    analyst = Analyst(ProviderChain([claude], max_retries=1), document_threshold=100_000)
+
+    proposal = analyst.analyze(big)
+
+    assert proposal.action.kind is ActionKind.PROPOSE_ONLY  # passes check_grounded
+    assert claude.calls == 1  # accepted first time: no retries
+    prompt = _one_line(render_prompt(big, claude.contexts[0]))
+    assert THRESHOLD_LINE.format(n=100_000) in prompt  # the model was told the number
+    assert "collection_doc_count: 300012 docs" in prompt  # and the count to compare it with
+
+
+def test_the_threshold_defaults_to_the_executors_when_not_in_context() -> None:
+    prompt = render_prompt(index_finding(), {"topology": "", "remediations": []})
+
+    assert THRESHOLD_LINE.format(n=100_000) in _one_line(prompt)
 
 
 def test_propose_only_is_accepted_for_an_index_finding() -> None:
